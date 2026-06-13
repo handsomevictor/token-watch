@@ -10,6 +10,11 @@
     <em>跨裝置聚合每個 AI 編程工具的即時用量。</em>
 </p>
 
+> [!NOTE]
+> **這是個人 fork —— 原創歸原作者所有。**
+> Token Monitor 由 **[@Javis603](https://github.com/Javis603)** 建立。原始倉庫：**https://github.com/Javis603/token-monitor**（MIT 授權）。
+> 本倉庫（[handsomevictor/token-watch](https://github.com/handsomevictor/token-watch)）是供個人使用的客製化版本——變更清單見 **[docs/CUSTOMIZATIONS.md](docs/CUSTOMIZATIONS.md)**。我不是原作者，專案的所有功勞歸上游。
+
 <p align="center">
     <a href="https://github.com/Javis603/token-monitor/releases"><img src="https://img.shields.io/github/v/release/Javis603/token-monitor?include_prereleases&style=flat-square&label=release&color=22c55e" alt="最新發布" /></a>
     <a href="https://github.com/Javis603/token-monitor/releases"><img src="https://img.shields.io/github/downloads/Javis603/token-monitor/total?style=flat-square&color=22c55e" alt="總下載量" /></a>

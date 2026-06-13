@@ -10,6 +10,11 @@
     <em>One live dashboard for every AI coding tool, synced across every machine.</em>
 </p>
 
+> [!NOTE]
+> **This is a personal fork — full credit to the original author.**
+> Token Monitor was created by **[@Javis603](https://github.com/Javis603)**. Original repository: **https://github.com/Javis603/token-monitor** (MIT License).
+> This repo ([handsomevictor/token-watch](https://github.com/handsomevictor/token-watch)) is a customized version for personal use — see **[docs/CUSTOMIZATIONS.md](docs/CUSTOMIZATIONS.md)** for everything that was changed. I am not the original author; all credit for the project goes upstream.
+
 <p align="center">
     <a href="https://github.com/Javis603/token-monitor/releases"><img src="https://img.shields.io/github/v/release/Javis603/token-monitor?include_prereleases&style=flat-square&label=release&color=22c55e" alt="Latest release" /></a>
     <a href="https://github.com/Javis603/token-monitor/releases"><img src="https://img.shields.io/github/downloads/Javis603/token-monitor/total?style=flat-square&color=22c55e" alt="Total downloads" /></a>
@@ -27,6 +32,18 @@
 ## What is Token Monitor?
 
 A desktop widget that shows live token usage and AI Tool Limits across various AI coding tools (Claude Code, Codex, Hermes Agent, OpenCode, OpenClaw, Cursor, Antigravity, Cline, and more) with real-time multi-device sync, historical usage trends, and breakdowns by tool, device, model, or session.
+
+## What's customized in this fork
+
+This fork keeps the upstream feature set and adds, on top of it (full details in [docs/CUSTOMIZATIONS.md](docs/CUSTOMIZATIONS.md)):
+
+- **Custom Claude data directory** — honors `CLAUDE_CONFIG_DIR` / a custom data dir (auto-detect + Browse) so it works with non-default Claude Code setups.
+- **Custom pricing overrides UI** — correct list prices or mark subscription-covered models as ~$0 for realistic cost (local only, no network).
+- **Usage rate graph** — tokens/cost/output per minute, 1h–1w windows, selectable aggregation granularity.
+- **Top view-tab bar**, larger draggable header, cost-by-model ranking, budget alerts, today-vs-yesterday, end-of-month projection, adjustable refresh interval, animation toggle.
+- **Clearer session rows** — project folder + AI-generated title instead of an opaque UUID.
+
+> Built on the original by [@Javis603](https://github.com/Javis603) — see the [original repo](https://github.com/Javis603/token-monitor).
 
 ## Supported Tools
 
