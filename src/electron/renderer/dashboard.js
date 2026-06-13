@@ -195,7 +195,7 @@ async function renderRate() {
   if (state.tab !== 'rate' || state.rateWindow !== win || state.rateMetric !== metric || state.rateGran !== gran) return;
   const points = (res && res.points) || [];
   const hasData = points.some((p) => Number(p.value) > 0);
-  els.rateEmpty.classList.toggle('hidden', hasData);
+  els.rateEmpty.style.display = hasData ? 'none' : '';
   if (!hasData) { els.rateChart.innerHTML = ''; state.rateModel = null; return; }
   const w = Math.max(320, els.rateChart.clientWidth || 800);
   const h = Math.max(200, els.rateChart.clientHeight || 320);
