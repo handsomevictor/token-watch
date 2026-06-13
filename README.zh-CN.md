@@ -26,7 +26,7 @@
 </p>
 
 <div align="center">
-    <img src=".github/assets/demo.gif">
+    <img src=".github/assets/widget-main.png" width="320" alt="Token Monitor 组件">
 </div>
 
 ## Token Monitor 是什么？
@@ -89,6 +89,10 @@ Token Monitor 对「Token 用量」「账户用量上限」和「session 明细�
 | 使用仪表板 — 总览 | 使用仪表板 — 趋势 |
 |:---:|:---:|
 | ![使用仪表板 总览](.github/assets/dashboard-overview.png) | ![使用仪表板 趋势](.github/assets/dashboard-trends.png) |
+
+| 使用仪表板 — 速率 _(本 fork)_ |
+|:---:|
+| ![使用仪表板 速率](.github/assets/dashboard-rate.png) |
 
 ## 安装
 

@@ -26,7 +26,7 @@
 </p>
 
 <div align="center">
-    <img src=".github/assets/demo.gif">
+    <img src=".github/assets/widget-main.png" width="320" alt="Token Monitor widget">
 </div>
 
 ## What is Token Monitor?
@@ -101,6 +101,10 @@ Most usage monitors are useful on the machine they run on. Token Monitor is buil
 | Usage Dashboard — Overview | Usage Dashboard — Trends |
 |:---:|:---:|
 | ![Usage Dashboard Overview](.github/assets/dashboard-overview.png) | ![Usage Dashboard Trends](.github/assets/dashboard-trends.png) |
+
+| Usage Dashboard — Rate _(this fork)_ |
+|:---:|
+| ![Usage Dashboard Rate](.github/assets/dashboard-rate.png) |
 
 ## Installation
 
