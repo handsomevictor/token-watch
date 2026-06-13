@@ -1,0 +1,2421 @@
+'use strict';
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { app, BrowserWindow, dialog, globalShortcut, ipcMain, nativeImage, Notification, screen, session, shell } = require('electron');
+const { defaultDeviceId, generateHubSecret, lanIpv4Addresses, loadDotEnv, pidFilePath, readJson, sharedDataDir, writeJsonAtomic } = require('../shared/config');
+const rateSeries = require('../shared/rateSeries');
+const { appVersion } = require('../shared/appVersion');
+const { DEFAULT_CLIENTS, clientsCsvForSetting } = require('../shared/clientTracking');
+const { startCollector, runTokscaleHourly } = require('../shared/collector');
+const { createHub } = require('../hub/server');
+const { deepseekToken, normalizeLimitsRefreshMs, parseBoolean, parseLimitProviders } = require('../shared/limitCollector');
+const {
+  normalizeClientDisplayOrder,
+  normalizeHiddenClients,
+  normalizePinnedClients
+} = require('./renderer/clientDisplayPreferences');
+const {
+  defaultViewDisplayPreferences,
+  normalizeHiddenViews,
+  normalizeViewDisplayOrder
+} = require('./renderer/viewDisplayPreferences');
+const {
+  checkNpmForNewer,
+  cleanupStaleStaging,
+  downloadFromNpm,
+  getTokscaleStatus,
+  resetToBundled
+} = require('../shared/tokscaleUpdater');
+const { checkLatestRelease } = require('../shared/appUpdater');
+const cursorAuth = require('../shared/cursorAuth');
+const cursorProbe = require('../shared/cursorProbe');
+const opencodeWeb = require('../shared/opencodeWeb');
+const semver = require('semver');
+const { normalizeCurrency } = require('../shared/currency');
+const {
+  applyArchivedClientUsage,
+  captureArchivedClientUsage,
+  normalizeArchivedClientUsage,
+  pruneArchivedClientUsage
+} = require('../shared/clientUsageArchive');
+const { aggregateDevices, aggregateHistory, carryDeviceHistory } = require('../shared/usage');
+const { historyPreview } = require('../shared/history');
+const { readSessionDetail } = require('../shared/sessionDetail');
+const { startDiscordRpc, stopDiscordRpc, updateDiscordRpc } = require('./discordRpc');
+const { buildTrayIcon, createTray, formatTrayText, pickUsageTrayIconId, popoverBounds } = require('./tray');
+const {
+  macActivationPolicyMode,
+  mainWindowCloseAction,
+  normalizeTrayModeSettings,
+  shouldCreateTray,
+  trayToggleAction
+} = require('./trayModeSettings');
+const { SERVICE_STATUS_PROVIDERS, createServiceStatusClient } = require('./serviceStatus');
+const { describeWindowBehavior, normalizeWindowBehaviorSettings } = require('./windowBehavior');
+const {
+  normalizeWindowToggleShortcut,
+  windowToggleShortcutAction,
+  windowToggleShortcutStatus
+} = require('./windowShortcut');
+const {
+  FLOATING_BUBBLE_HANDLE_HEIGHT,
+  FLOATING_BUBBLE_HANDLE_WIDTH,
+  canUseFloatingBubble,
+  collapsedFloatingBubbleBounds,
+  dragFloatingBubbleBounds,
+  expandedFloatingBubbleBounds,
+  floatingBubbleCollapsedArea,
+  floatingBubbleCollapsedMargin,
+  floatingBubbleCollapsePlan,
+  floatingBubbleInitialRendererQuery,
+  floatingBubbleNativeGlassEnabled,
+  floatingBubbleSide,
+  floatingBubbleWindowChrome,
+  normalizeInitialRendererViewState,
+  moveFloatingBubbleBounds
+} = require('./floatingBubble');
+const { applyWindowsChrome } = require('./windowsChrome');
+
+if (!app.isPackaged) loadDotEnv();
+
+const APP_NAME = 'Token Monitor';
+const APP_ICON_PATH = path.join(__dirname, '..', '..', 'assets', 'icon.png');
+
+const DEFAULT_WINDOW = { width: 500, height: 720 };
+const WINDOW_LIMITS = { minWidth: 240, minHeight: 140, maxWidth: 1200, maxHeight: 1400 };
+const ZOOM_LIMITS = { min: 0.7, max: 1.6, step: 0.1 };
+const CSP_HEADER = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self'",
+  "img-src 'self' data:",
+  "font-src 'self'",
+  "connect-src 'self'",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'"
+].join('; ');
+const TRAY_CONTENT_VALUES = new Set(['tokens', 'cost', 'both', 'tokensAll', 'costAll', 'bothAll', 'bars', 'barsSession', 'barsWeekly', 'barsAllSessions', 'icon']);
+const HUB_MODE_VALUES = new Set(['local', 'client', 'host']);
+const LANGUAGE_VALUES = new Set(['auto', 'en', 'zh-TW', 'zh-CN']);
+const HUB_DEFAULT_PORT = 17321;
+const DEFAULT_CLIENT_LIST = DEFAULT_CLIENTS.split(',').map((id) => ({ id }));
+const DEFAULT_VIEW_LIST = ['tool', 'status', 'device', 'model', 'session', 'limits', 'trends'].map((id) => ({ id }));
+
+let mainWindow = null;
+let dashboardWindow = null;
+let settingsPath = null;
+let settings = null;
+let rendererViewState = normalizeInitialRendererViewState();
+const serviceStatusClient = createServiceStatusClient();
+const STATUS_PAGE_HOSTS = new Set(SERVICE_STATUS_PROVIDERS.map((provider) => new URL(provider.pageUrl).hostname));
+
+app.setName(APP_NAME);
+if (process.platform === 'win32') app.setAppUserModelId('com.javis.tokenmonitor');
+
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) app.exit(0);
+
+function normalizeDataDirs(value) {
+  const out = { claude: '' };
+  const claude = value && typeof value === 'object' ? value.claude : '';
+  const resolved = String(claude || '').trim();
+  // Keep only an absolute path that currently exists; otherwise '' = auto/env default.
+  if (resolved && path.isAbsolute(resolved)) {
+    try { if (fs.statSync(resolved).isDirectory()) out.claude = path.resolve(resolved); } catch (_) {}
+  }
+  return out;
+}
+
+// Enumerate plausible Claude data dirs: ~/.claude (default), $CLAUDE_CONFIG_DIR,
+// any ~/.claude* directory, and the currently-saved choice. De-duped by resolved path.
+function listClaudeDataDirCandidates() {
+  const home = os.homedir();
+  const seen = new Set();
+  const out = [];
+  const push = (dir, source) => {
+    if (!dir) return;
+    const resolved = path.resolve(dir);
+    if (seen.has(resolved)) return;
+    try { if (!fs.statSync(resolved).isDirectory()) return; } catch (_) { return; }
+    seen.add(resolved);
+    out.push({ path: resolved, label: path.basename(resolved) || resolved, source });
+  };
+  push(path.join(home, '.claude'), 'default');
+  if (process.env.CLAUDE_CONFIG_DIR) push(process.env.CLAUDE_CONFIG_DIR, 'env');
+  try {
+    for (const name of fs.readdirSync(home)) {
+      if (/^\.claude/i.test(name)) push(path.join(home, name), 'detected');
+    }
+  } catch (_) {}
+  if (settings && settings.dataDirs && settings.dataDirs.claude) push(settings.dataDirs.claude, 'saved');
+  return out;
+}
+
+const USAGE_REFRESH_OPTIONS = [15000, 30000, 60000, 120000, 300000, 600000, 900000];
+function normalizeUsageRefreshMs(value, fallback = 300000) {
+  const n = Number(value);
+  if (USAGE_REFRESH_OPTIONS.includes(n)) return n;
+  return USAGE_REFRESH_OPTIONS.includes(Number(fallback)) ? Number(fallback) : 300000;
+}
+
+function defaultSettings() {
+  const envHubUrl = process.env.TOKEN_MONITOR_HUB_URL || '';
+  const windowBehavior = process.env.TOKEN_MONITOR_ALWAYS_ON_TOP === '0' ? 'normal' : 'floating';
+  return {
+    hubMode: envHubUrl ? 'client' : 'local',
+    hubUrl: envHubUrl,
+    hubHostPort: Math.max(1, Math.min(65535, Number(process.env.TOKEN_MONITOR_PORT) || HUB_DEFAULT_PORT)),
+    // Default to TOKEN_MONITOR_SECRET so agents that already trust this env
+    // value (matching what the CLI hub uses) can connect to the widget's
+    // embedded hub without a fresh round of credential sharing. Falls back
+    // to a random secret generated in startEmbeddedHub() if env is empty.
+    hubHostSecret: process.env.TOKEN_MONITOR_SECRET || '',
+    secret: process.env.TOKEN_MONITOR_SECRET || '',
+    windowBehavior,
+    alwaysOnTop: windowBehavior === 'floating',
+    refreshMs: Number(process.env.TOKEN_MONITOR_WIDGET_REFRESH_MS || 15000),
+    usageRefreshMs: normalizeUsageRefreshMs(process.env.TOKEN_MONITOR_USAGE_REFRESH_MS),
+    numberAnimation: true,
+    alwaysOnTopAboveAll: false,
+    modelSortByCost: false,
+    dailyBudget: 0,
+    monthlyBudget: 0,
+    dataDirs: { claude: process.env.CLAUDE_CONFIG_DIR ? path.resolve(process.env.CLAUDE_CONFIG_DIR) : '' },
+    glassOpacity: 68,
+    glassBlur: 32,
+    systemGlass: true,
+    showLiveDot: true,
+    showToolIcons: true,
+    titleIconOnly: false,
+    themeColors: {},
+    vendorColors: {},
+    floatingBubbleEnabled: false,
+    floatingBubbleTrigger: 'click',
+    floatingBubbleContent: 'icon',
+    floatingBubbleBounds: null,
+    lastViewState: { period: 'today', breakdown: 'tool' },
+    discordRpcEnabled: false,
+    deviceId: process.env.TOKEN_MONITOR_DEVICE_ID || defaultDeviceId(),
+    lastPostedDeviceId: '',
+    clients: clientsCsvForSetting(process.env.TOKEN_MONITOR_CLIENTS),
+    clientDisplayOrder: '',
+    hiddenClients: '',
+    pinnedClients: '',
+    viewDisplayOrder: '',
+    hiddenViews: defaultViewDisplayPreferences().hiddenViews,
+    historyEnabled: false,
+    serviceProviderDisplayOrder: '',
+    hiddenServiceProviders: '',
+    serviceStatusRefreshMs: 60000,
+    archivedClientUsage: { version: 1, clients: {} },
+    allTimeSince: process.env.TOKEN_MONITOR_ALL_TIME_SINCE || '2024-01-01',
+    limitsEnabled: parseBoolean(process.env.TOKEN_MONITOR_LIMITS_ENABLED, true),
+    limitProviders: parseLimitProviders(process.env.TOKEN_MONITOR_LIMIT_PROVIDERS).join(','),
+    limitProviderOrder: defaultLimitProviderOrder(),
+    limitsRefreshMs: normalizeLimitsRefreshMs(process.env.TOKEN_MONITOR_LIMITS_REFRESH_MS),
+    showLimitSource: parseBoolean(process.env.TOKEN_MONITOR_SHOW_LIMIT_SOURCE, false),
+    windowBounds: null,
+    zoomFactor: 1,
+    showTrayIcon: true,
+    trayMode: false,
+    trayContent: 'tokens',
+    windowToggleShortcut: '',
+    currency: normalizeCurrency(process.env.TOKEN_MONITOR_CURRENCY || 'USD'),
+    startAtLogin: false,
+    language: 'auto',
+    opencodeCookie: '',
+    deepseekApiKey: '',
+    appUpdate: {
+      lastCheckedAt: null,
+      lastKnownLatest: null,
+      dismissedVersion: null
+    }
+  };
+}
+
+function defaultLimitProviders() {
+  return parseLimitProviders(process.env.TOKEN_MONITOR_LIMIT_PROVIDERS).join(',');
+}
+
+function defaultLimitProviderOrder() {
+  return parseLimitProviders().join(',');
+}
+
+function normalizeDeepSeekApiKey(value) {
+  return deepseekToken({}, String(value || ''));
+}
+
+function currentDeepSeekApiKey() {
+  return settings?.deepseekApiKey || deepseekToken(process.env);
+}
+
+function migrateLimitProviders(value) {
+  const normalized = parseLimitProviders(value).join(',');
+  // Upgrade: users who had the old 2-provider or 4-provider full defaults get the new default (which includes opencode).
+  if (normalized === 'claude,codex') return defaultLimitProviders();
+  if (normalized === 'claude,codex,cursor,antigravity') return defaultLimitProviders();
+  return normalized;
+}
+
+function migrateLimitProviderOrder(value) {
+  return parseLimitProviders(value).join(',') || defaultLimitProviderOrder();
+}
+
+function migrateClientDisplayOrder(value) {
+  const known = new Set(DEFAULT_CLIENTS.split(','));
+  const raw = Array.isArray(value) ? value : String(value || '').split(',');
+  const hasKnownClient = raw.some((item) => known.has(String(item || '').trim().toLowerCase()));
+  return hasKnownClient ? normalizeClientDisplayOrder(value, DEFAULT_CLIENT_LIST).join(',') : '';
+}
+
+const SERVICE_STATUS_REFRESH_VALUES = new Set([0, 60000, 120000, 300000, 900000, 1800000]);
+function normalizeServiceStatusRefreshMs(value) {
+  const n = Number(value);
+  return SERVICE_STATUS_REFRESH_VALUES.has(n) ? n : 60000;
+}
+
+function migrateViewDisplayOrder(value) {
+  const known = new Set(DEFAULT_VIEW_LIST.map((view) => view.id));
+  const raw = Array.isArray(value) ? value : String(value || '').split(',');
+  const hasKnownView = raw.some((item) => known.has(String(item || '').trim().toLowerCase()));
+  return hasKnownView ? normalizeViewDisplayOrder(value, DEFAULT_VIEW_LIST).join(',') : '';
+}
+
+function normalizeTrayContent(value, fallback = 'tokens') {
+  const v = String(value || '').trim();
+  return TRAY_CONTENT_VALUES.has(v) ? v : fallback;
+}
+
+function normalizeHubMode(value, fallback = 'local') {
+  const v = String(value || '').trim();
+  return HUB_MODE_VALUES.has(v) ? v : fallback;
+}
+
+function normalizeLanguageSetting(value, fallback = 'auto') {
+  const raw = String(value || '').replace(/_/g, '-').trim();
+  const lower = raw.toLowerCase();
+  if (lower === 'auto') return 'auto';
+  if (lower === 'en' || lower.startsWith('en-')) return 'en';
+  if (lower === 'zh-tw' || lower.startsWith('zh-hant') || /-(tw|hk|mo)\b/i.test(raw)) return 'zh-TW';
+  if (lower === 'zh-cn' || lower.startsWith('zh-hans') || /-(cn|sg|my)\b/i.test(raw)) return 'zh-CN';
+  return LANGUAGE_VALUES.has(raw) ? raw : fallback;
+}
+
+function normalizeHubPort(value, fallback = HUB_DEFAULT_PORT) {
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n) || n < 1 || n > 65535) return fallback;
+  return n;
+}
+
+function clampZoom(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 1;
+  return Math.min(ZOOM_LIMITS.max, Math.max(ZOOM_LIMITS.min, Number(n.toFixed(2))));
+}
+
+function isBoundsOnScreen(bounds) {
+  if (!bounds || typeof bounds.x !== 'number' || typeof bounds.y !== 'number') return false;
+  try {
+    const display = screen.getDisplayMatching({
+      x: bounds.x, y: bounds.y, width: bounds.width || 1, height: bounds.height || 1
+    });
+    const wa = display.workArea;
+    return bounds.x + bounds.width > wa.x &&
+      bounds.x < wa.x + wa.width &&
+      bounds.y + bounds.height > wa.y &&
+      bounds.y < wa.y + wa.height;
+  } catch (_) { return false; }
+}
+
+function restoredBounds() {
+  const saved = settings?.windowBounds;
+  if (!saved || typeof saved.width !== 'number' || typeof saved.height !== 'number') return null;
+  const width = Math.min(WINDOW_LIMITS.maxWidth, Math.max(WINDOW_LIMITS.minWidth, saved.width));
+  const height = Math.min(WINDOW_LIMITS.maxHeight, Math.max(WINDOW_LIMITS.minHeight, saved.height));
+  if (!isBoundsOnScreen({ ...saved, width, height })) return { width, height };
+  return { x: saved.x, y: saved.y, width, height };
+}
+
+let persistBoundsTimer = null;
+let floatingBubbleAutoCollapseTimer = null;
+const floatingBubbleState = { collapsed: false, side: null, collapsedBounds: null, expandedBounds: null, suppressNextCollapse: false, contentSize: null };
+let mainWindowChrome = { collapsedFloatingBubble: false };
+
+function stopPersistBoundsTimer() {
+  if (persistBoundsTimer) clearTimeout(persistBoundsTimer);
+  persistBoundsTimer = null;
+}
+
+function floatingBubblePayload() {
+  return {
+    enabled: canUseFloatingBubble(settings),
+    collapsed: floatingBubbleState.collapsed,
+    side: floatingBubbleState.side
+  };
+}
+
+// Load settings once and, on that first load, seed the in-memory view state
+// from the persisted snapshot so a cold start reopens the last-used view.
+function ensureSettingsLoaded() {
+  if (settings) return settings;
+  settings = readSettings();
+  rendererViewState = normalizeInitialRendererViewState(settings.lastViewState, rendererViewState);
+  return settings;
+}
+
+function updateRendererViewState(patch) {
+  const previous = rendererViewState;
+  rendererViewState = normalizeInitialRendererViewState({
+    ...rendererViewState,
+    ...(patch || {})
+  }, rendererViewState);
+  const changed = previous.period !== rendererViewState.period
+    || previous.breakdown !== rendererViewState.breakdown;
+  if (changed && settings) {
+    settings.lastViewState = { ...rendererViewState };
+    saveSettings();
+  }
+  return rendererViewState;
+}
+
+function sendFloatingBubbleState() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try { mainWindow.webContents.send('floatingBubble:state', floatingBubblePayload()); } catch (_) {}
+}
+
+function stopFloatingBubbleAutoCollapseTimer() {
+  if (floatingBubbleAutoCollapseTimer) clearTimeout(floatingBubbleAutoCollapseTimer);
+  floatingBubbleAutoCollapseTimer = null;
+}
+
+function restoreWindowSizeLimits() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (typeof mainWindow.setMinimumSize === 'function') {
+    mainWindow.setMinimumSize(WINDOW_LIMITS.minWidth, WINDOW_LIMITS.minHeight);
+  }
+  if (typeof mainWindow.setMaximumSize === 'function') {
+    mainWindow.setMaximumSize(WINDOW_LIMITS.maxWidth, WINDOW_LIMITS.maxHeight);
+  }
+}
+
+function applyCollapsedFloatingBubbleLimits(bounds) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (typeof mainWindow.setMinimumSize === 'function') {
+    mainWindow.setMinimumSize(bounds?.width || FLOATING_BUBBLE_HANDLE_WIDTH, bounds?.height || FLOATING_BUBBLE_HANDLE_HEIGHT);
+  }
+  if (typeof mainWindow.setMaximumSize === 'function') {
+    mainWindow.setMaximumSize(bounds?.width || FLOATING_BUBBLE_HANDLE_WIDTH, bounds?.height || FLOATING_BUBBLE_HANDLE_HEIGHT);
+  }
+  if (typeof mainWindow.setResizable === 'function') mainWindow.setResizable(false);
+  mainWindow.setAlwaysOnTop(true, process.platform === 'win32' ? 'screen-saver' : 'floating');
+  if (typeof mainWindow.setSkipTaskbar === 'function') mainWindow.setSkipTaskbar(true);
+}
+
+function displayForBounds(bounds) {
+  if (!bounds || typeof bounds.x !== 'number' || typeof bounds.y !== 'number') return null;
+  try {
+    return screen.getDisplayMatching({
+      x: bounds.x,
+      y: bounds.y,
+      width: bounds.width || 1,
+      height: bounds.height || 1
+    });
+  } catch (_) {
+    return null;
+  }
+}
+
+function displayForPoint(point) {
+  if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) return null;
+  try {
+    return screen.getDisplayNearestPoint({ x: Number(point.x), y: Number(point.y) });
+  } catch (_) {
+    return null;
+  }
+}
+
+function collapsedAreaForDisplay(display) {
+  return floatingBubbleCollapsedArea(display, process.platform) || display?.workArea || display?.bounds || null;
+}
+
+function collapsedMargin() {
+  return floatingBubbleCollapsedMargin(process.platform);
+}
+
+function persistWindowBounds(next) {
+  const prev = settings.windowBounds || {};
+  if (prev.x === next.x && prev.y === next.y && prev.width === next.width && prev.height === next.height) return false;
+  settings.windowBounds = next;
+  saveSettings();
+  return true;
+}
+
+function collapseFloatingBubble(plan) {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  stopFloatingBubbleAutoCollapseTimer();
+  const { side, expandedBounds, collapsedBounds } = plan || {};
+  if (!expandedBounds || !collapsedBounds) return false;
+  floatingBubbleState.collapsed = true;
+  floatingBubbleState.side = side;
+  floatingBubbleState.collapsedBounds = collapsedBounds;
+  floatingBubbleState.expandedBounds = expandedBounds;
+  settings.floatingBubbleBounds = collapsedBounds;
+  applyNativeMaterial();
+  if (process.platform === 'win32') {
+    persistWindowBounds(expandedBounds);
+    replaceMainWindow(collapsedBounds, {
+      collapsedFloatingBubble: true,
+      focus: false,
+      waitForContent: settings.floatingBubbleContent !== 'icon'
+    });
+    sendFloatingBubbleState();
+    return true;
+  }
+  applyCollapsedFloatingBubbleLimits(collapsedBounds);
+  mainWindow.setBounds(collapsedBounds);
+  persistWindowBounds(expandedBounds);
+  sendFloatingBubbleState();
+  return true;
+}
+
+function maybeCollapseFloatingBubble(bounds) {
+  const display = displayForBounds(bounds);
+  if (!display) return false;
+  const collapsedArea = collapsedAreaForDisplay(display);
+  const plan = floatingBubbleCollapsePlan(bounds, display.workArea, settings, {
+    collapsed: floatingBubbleState.collapsed,
+    suppressNextCollapse: floatingBubbleState.suppressNextCollapse,
+    collapsedArea,
+    collapsedMargin: collapsedMargin(),
+    collapsedBounds: settings?.floatingBubbleBounds || floatingBubbleState.collapsedBounds,
+    handleWidth: floatingBubbleState.contentSize?.width,
+    handleHeight: floatingBubbleState.contentSize?.height
+  });
+  floatingBubbleState.suppressNextCollapse = false;
+  if (!plan) return false;
+  return collapseFloatingBubble(plan);
+}
+
+function expandFloatingBubble(options = {}) {
+  if (!mainWindow || mainWindow.isDestroyed() || !floatingBubbleState.collapsed) return false;
+  stopFloatingBubbleAutoCollapseTimer();
+  const current = mainWindow.getBounds();
+  const display = displayForBounds(floatingBubbleState.expandedBounds || current) || displayForBounds(current);
+  const target = display
+    ? expandedFloatingBubbleBounds(current, display.workArea, floatingBubbleState.expandedBounds)
+    : floatingBubbleState.expandedBounds;
+  floatingBubbleState.collapsed = false;
+  floatingBubbleState.side = null;
+  floatingBubbleState.collapsedBounds = current;
+  floatingBubbleState.expandedBounds = target;
+  applyNativeMaterial();
+  if (target) {
+    floatingBubbleState.suppressNextCollapse = true;
+    if (process.platform === 'win32' && mainWindowChrome.collapsedFloatingBubble) {
+      persistWindowBounds(target);
+      replaceMainWindow(target, {
+        collapsedFloatingBubble: false,
+        focus: options.focus !== false,
+        suppressInitialNumberAnimation: true,
+        waitForContent: true,
+        inactive: options.focus === false
+      });
+      setTimeout(() => { floatingBubbleState.suppressNextCollapse = false; }, 300);
+      sendFloatingBubbleState();
+      return true;
+    }
+    restoreWindowSizeLimits();
+    mainWindow.setBounds(target);
+    persistWindowBounds(target);
+    setTimeout(() => { floatingBubbleState.suppressNextCollapse = false; }, 300);
+  }
+  applyWindowSettings();
+  sendFloatingBubbleState();
+  if (options.focus !== false) {
+    mainWindow.show();
+    mainWindow.focus();
+  }
+  return true;
+}
+
+function scheduleFloatingBubbleAutoCollapse() {
+  stopFloatingBubbleAutoCollapseTimer();
+  if (!canUseFloatingBubble(settings) || floatingBubbleState.collapsed) return;
+  floatingBubbleAutoCollapseTimer = setTimeout(() => {
+    floatingBubbleAutoCollapseTimer = null;
+    if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isFocused()) return;
+    maybeCollapseFloatingBubble(mainWindow.getBounds());
+  }, 180);
+}
+
+function syncFloatingBubbleAvailability() {
+  if (!canUseFloatingBubble(settings)) {
+    if (floatingBubbleState.collapsed) expandFloatingBubble({ focus: false });
+    else {
+      floatingBubbleState.side = null;
+      floatingBubbleState.collapsedBounds = null;
+      floatingBubbleState.expandedBounds = null;
+      floatingBubbleState.suppressNextCollapse = false;
+      stopFloatingBubbleAutoCollapseTimer();
+      restoreWindowSizeLimits();
+    }
+    sendFloatingBubbleState();
+    return;
+  }
+  sendFloatingBubbleState();
+}
+
+function persistBoundsSoon() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized() || mainWindow.isFullScreen()) return;
+  stopPersistBoundsTimer();
+  persistBoundsTimer = setTimeout(() => {
+    persistBoundsTimer = null;
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    const next = mainWindow.getBounds();
+    const prev = settings.windowBounds || {};
+    if (settings?.trayMode) {
+      // Popover x/y is anchored to the tray icon each open; only the size carries over.
+      if (prev.width === next.width && prev.height === next.height) return;
+      settings.windowBounds = { ...prev, width: next.width, height: next.height };
+    } else if (floatingBubbleState.collapsed && floatingBubbleState.expandedBounds) {
+      floatingBubbleState.collapsedBounds = next;
+      const display = displayForBounds(next);
+      const nextSide = display ? floatingBubbleSide(next, collapsedAreaForDisplay(display)) : floatingBubbleState.side;
+      if (nextSide !== floatingBubbleState.side) {
+        floatingBubbleState.side = nextSide;
+        sendFloatingBubbleState();
+      }
+      const previousBubble = settings.floatingBubbleBounds || {};
+      if (previousBubble.x === next.x &&
+        previousBubble.y === next.y &&
+        previousBubble.width === next.width &&
+        previousBubble.height === next.height) return;
+      settings.floatingBubbleBounds = next;
+    } else {
+      if (prev.x === next.x && prev.y === next.y && prev.width === next.width && prev.height === next.height) return;
+      settings.windowBounds = next;
+    }
+    saveSettings();
+  }, 400);
+}
+
+function applyZoomFactor(target = mainWindow) {
+  if (!target || target.isDestroyed()) return;
+  target.webContents.setZoomFactor(clampZoom(settings.zoomFactor));
+}
+
+function setZoomFactor(value) {
+  const next = clampZoom(value);
+  if (next === clampZoom(settings.zoomFactor)) return;
+  settings.zoomFactor = next;
+  saveSettings();
+  applyZoomFactor();
+}
+
+function adjustZoom(delta) {
+  setZoomFactor(clampZoom(settings.zoomFactor) + delta);
+}
+
+function readSettings() {
+  settingsPath = path.join(app.getPath('userData'), 'settings.json');
+  try {
+    const defaults = defaultSettings();
+    const saved = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    if (!saved.secret && defaults.secret) delete saved.secret;
+    const merged = { ...defaults, ...saved };
+    // Migrate older configs that predate hubMode: infer from hubUrl.
+    if (saved.hubMode === undefined) {
+      merged.hubMode = (saved.hubUrl && String(saved.hubUrl).trim()) ? 'client' : 'local';
+    }
+    if (saved.limitProviders !== undefined) {
+      merged.limitProviders = migrateLimitProviders(saved.limitProviders);
+    }
+    if (saved.limitProviderOrder !== undefined) {
+      merged.limitProviderOrder = migrateLimitProviderOrder(saved.limitProviderOrder);
+    }
+    if (saved.clientDisplayOrder !== undefined) {
+      merged.clientDisplayOrder = migrateClientDisplayOrder(saved.clientDisplayOrder);
+    }
+    if (saved.hiddenClients !== undefined) {
+      merged.hiddenClients = normalizeHiddenClients(saved.hiddenClients, DEFAULT_CLIENT_LIST);
+    }
+    if (saved.pinnedClients !== undefined) {
+      merged.pinnedClients = normalizePinnedClients(saved.pinnedClients, DEFAULT_CLIENT_LIST);
+    }
+    if (saved.viewDisplayOrder !== undefined) {
+      merged.viewDisplayOrder = migrateViewDisplayOrder(saved.viewDisplayOrder);
+    }
+    if (saved.hiddenViews !== undefined) {
+      merged.hiddenViews = normalizeHiddenViews(saved.hiddenViews, DEFAULT_VIEW_LIST);
+    }
+    if (saved.historyEnabled !== undefined) {
+      merged.historyEnabled = parseBoolean(saved.historyEnabled, false);
+    }
+    if (saved.serviceProviderDisplayOrder !== undefined) {
+      merged.serviceProviderDisplayOrder = String(saved.serviceProviderDisplayOrder || '');
+    }
+    if (saved.hiddenServiceProviders !== undefined) {
+      merged.hiddenServiceProviders = String(saved.hiddenServiceProviders || '');
+    }
+    if (saved.serviceStatusRefreshMs !== undefined) {
+      merged.serviceStatusRefreshMs = normalizeServiceStatusRefreshMs(saved.serviceStatusRefreshMs);
+    }
+    if (saved.windowBehavior === undefined && saved.alwaysOnTop !== undefined) {
+      merged.windowBehavior = saved.alwaysOnTop ? 'floating' : 'normal';
+    }
+    if (saved.lastViewState !== undefined) {
+      merged.lastViewState = normalizeInitialRendererViewState(saved.lastViewState);
+    }
+    merged.hubMode = normalizeHubMode(merged.hubMode);
+    merged.language = normalizeLanguageSetting(merged.language);
+    merged.currency = normalizeCurrency(merged.currency);
+    merged.hubHostPort = normalizeHubPort(merged.hubHostPort);
+    merged.hubHostSecret = typeof merged.hubHostSecret === 'string' ? merged.hubHostSecret : '';
+    merged.floatingBubbleEnabled = parseBoolean(merged.floatingBubbleEnabled ?? merged.edgeDrawerEnabled, false);
+    merged.archivedClientUsage = normalizeArchivedClientUsage(merged.archivedClientUsage);
+    delete merged.edgeDrawerEnabled;
+    merged.floatingBubbleTrigger = merged.floatingBubbleTrigger === 'hover' ? 'hover' : 'click';
+    merged.floatingBubbleContent = normalizeTrayContent(merged.floatingBubbleContent, 'icon');
+    merged.windowToggleShortcut = normalizeWindowToggleShortcut(merged.windowToggleShortcut);
+    Object.assign(merged, normalizeTrayModeSettings(merged));
+    return normalizeWindowBehaviorSettings(merged);
+  }
+  catch (_error) {
+    const defaults = defaultSettings();
+    Object.assign(defaults, normalizeTrayModeSettings(defaults));
+    return normalizeWindowBehaviorSettings(defaults);
+  }
+}
+
+function saveSettings() {
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+}
+
+function loginItemEnabledHere() {
+  return app.isPackaged && process.platform !== 'linux';
+}
+
+function currentLoginItemState() {
+  if (!loginItemEnabledHere()) return false;
+  try { return Boolean(app.getLoginItemSettings().openAtLogin); }
+  catch (_) { return false; }
+}
+
+function applyLoginItem(startAtLogin) {
+  if (!loginItemEnabledHere()) return false;
+  app.setLoginItemSettings({ openAtLogin: Boolean(startAtLogin) });
+  return currentLoginItemState();
+}
+
+function syncLoginItemSettingFromOs() {
+  if (!settings) return;
+  const actual = currentLoginItemState();
+  if (settings.startAtLogin === actual) return;
+  settings.startAtLogin = actual;
+  saveSettings();
+}
+
+function trackedClientSet(value) {
+  return new Set(String(value || '').split(',').map((item) => item.trim().toLowerCase()).filter(Boolean));
+}
+
+function removedTrackedClients(previousClients, nextClients) {
+  const previous = trackedClientSet(previousClients);
+  const next = trackedClientSet(nextClients);
+  return Array.from(previous).filter((client) => !next.has(client));
+}
+
+function localArchiveSourceDevice() {
+  const deviceId = settings?.deviceId || defaultDeviceId();
+  if (lastCollectedDevice?.deviceId === deviceId) return lastCollectedDevice;
+  if (localDevice?.deviceId === deviceId) return localDevice;
+  return (latestStats?.devices || []).find((device) => device?.deviceId === deviceId) || null;
+}
+
+function updateArchivedClientUsage(previousClients, nextClients) {
+  const removedClients = removedTrackedClients(previousClients, nextClients);
+  let archive = pruneArchivedClientUsage(settings.archivedClientUsage, nextClients);
+  if (removedClients.length > 0) {
+    archive = captureArchivedClientUsage(archive, localArchiveSourceDevice(), removedClients);
+  }
+  settings.archivedClientUsage = archive;
+}
+
+function summaryWithArchivedClientUsage(summary) {
+  return applyArchivedClientUsage(summary, settings?.archivedClientUsage, {
+    activeClients: settings?.clients,
+    now: new Date()
+  });
+}
+
+function applyMacActivationPolicy(state = {}) {
+  if (process.platform !== 'darwin') return;
+  const mainWindowVisible = state.mainWindowVisible !== undefined
+    ? state.mainWindowVisible
+    : mainWindow && !mainWindow.isDestroyed()
+      ? mainWindow.isVisible()
+      : true;
+  const mode = macActivationPolicyMode(settings, { mainWindowVisible });
+  if (typeof app.setActivationPolicy === 'function') {
+    try { app.setActivationPolicy(mode); } catch (_) {}
+  }
+  if (!app.dock) return;
+  if (mode === 'accessory') app.dock.hide();
+  else app.dock.show();
+}
+
+function applyWindowSettings() {
+  if (!mainWindow) return;
+  if (floatingBubbleState.collapsed) {
+    applyCollapsedFloatingBubbleLimits(mainWindow.getBounds());
+    return;
+  }
+  const behavior = describeWindowBehavior(settings);
+  const aotLevel = process.platform === 'win32'
+    ? 'screen-saver'
+    : (settings.alwaysOnTopAboveAll ? 'screen-saver' : 'floating');
+  mainWindow.setAlwaysOnTop(behavior.alwaysOnTop, aotLevel);
+  if (settings.alwaysOnTopAboveAll && behavior.alwaysOnTop && typeof mainWindow.setVisibleOnAllWorkspaces === 'function') {
+    mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  }
+  if (typeof mainWindow.setMovable === 'function') mainWindow.setMovable(behavior.draggable);
+  if (typeof mainWindow.setResizable === 'function') mainWindow.setResizable(behavior.resizable);
+  if (typeof mainWindow.setIgnoreMouseEvents === 'function') {
+    mainWindow.setIgnoreMouseEvents(behavior.mousePassthrough);
+  }
+  if (typeof mainWindow.setFocusable === 'function') mainWindow.setFocusable(behavior.focusable);
+  if (typeof mainWindow.setSkipTaskbar === 'function') mainWindow.setSkipTaskbar(Boolean(settings?.trayMode));
+  if (!behavior.focusable && typeof mainWindow.blur === 'function') mainWindow.blur();
+}
+
+function nativeBlurEnabled(source = settings) {
+  return floatingBubbleNativeGlassEnabled(source, floatingBubbleState, process.platform);
+}
+
+function keepNativeBlurActive() {
+  if (!mainWindow) return;
+  if (!nativeBlurEnabled()) return;
+  if (process.platform === 'darwin' && typeof mainWindow.setVisualEffectState === 'function') {
+    mainWindow.setVisualEffectState('active');
+  }
+}
+
+function applyNativeMaterial(source = settings) {
+  if (!mainWindow) return;
+  const enabled = nativeBlurEnabled(source);
+  if (process.platform === 'darwin' && typeof mainWindow.setVibrancy === 'function') {
+    mainWindow.setVibrancy(enabled ? 'hud' : null);
+    if (typeof mainWindow.setVisualEffectState === 'function') {
+      mainWindow.setVisualEffectState(enabled ? 'active' : 'inactive');
+    }
+  }
+  // Windows: backgroundMaterial is locked in at window creation. setBackgroundMaterial('none')
+  // does not restore layered-window transparency once DWM SystemBackdrop has been engaged,
+  // so toggling is handled by rebuildWindow() instead.
+}
+
+function withHistoryPreview(stats, devices) {
+  const history = settings?.historyEnabled === false ? aggregateHistory([], 0) : aggregateHistory(devices, 0);
+  stats.historyPreview = historyPreview(history);
+  return stats;
+}
+
+let mode = 'idle';
+let localCollectorHandle = null;
+let localDevice = null;
+let localStats = null;
+let sseAbortController = null;
+let sseRetryTimer = null;
+let streamConnected = false;
+let syncCollectorHandle = null;
+let lastCollectedDevice = null;
+let tray = null;
+let latestStats = null;
+let suppressNextBlurHide = false;
+
+// --- Usage-rate sampling (for the dashboard rate graph) ---------------------
+// Keep ~13h of cumulative "today" samples on disk so fine windows (<=12h) survive
+// restarts; coarse windows (1d/1w) come from `tokscale hourly` on demand.
+const RATE_SERIES_MAX_AGE_MS = 13 * 60 * 60 * 1000;
+let rateSeriesData = [];
+let rateSeriesLoaded = false;
+let rateSeriesWriteTimer = null;
+function rateSeriesPath() { return path.join(sharedDataDir(), 'usage-rate.json'); }
+function loadRateSeries() {
+  if (rateSeriesLoaded) return;
+  rateSeriesLoaded = true;
+  const stored = readJson(rateSeriesPath(), null);
+  rateSeriesData = Array.isArray(stored && stored.samples) ? stored.samples : [];
+}
+function persistRateSeriesSoon() {
+  if (rateSeriesWriteTimer) return;
+  rateSeriesWriteTimer = setTimeout(() => {
+    rateSeriesWriteTimer = null;
+    try { writeJsonAtomic(rateSeriesPath(), { version: 1, samples: rateSeriesData }); } catch (_) {}
+  }, 4000);
+}
+function sampleUsageRate(summary) {
+  const today = summary && summary.today;
+  if (!today) return;
+  loadRateSeries();
+  rateSeriesData = rateSeries.appendSample(rateSeriesData, {
+    t: Date.now(),
+    total: Number(today.totalTokens) || 0,
+    output: Number(today.outputTokens) || 0,
+    cost: Number(today.costUsd) || 0
+  }, RATE_SERIES_MAX_AGE_MS);
+  persistRateSeriesSoon();
+}
+
+const RATE_WINDOWS = { '1h': 3600000, '3h': 3 * 3600000, '6h': 6 * 3600000, '12h': 12 * 3600000, '1d': 24 * 3600000, '1w': 7 * 24 * 3600000 };
+let hourlyRateCache = { at: 0, since: '', data: null };
+async function fetchHourlyEntries(sinceMs) {
+  const since = new Date(sinceMs).toISOString().slice(0, 10);
+  if (hourlyRateCache.data && hourlyRateCache.since === since && Date.now() - hourlyRateCache.at < 60000) return hourlyRateCache.data;
+  let entries = [];
+  try {
+    const res = await runTokscaleHourly({ clients: clientsCsvForSetting(settings.clients), since, commandTimeoutMs: 60000 });
+    entries = (res && res.entries) || [];
+  } catch (_) { entries = []; }
+  hourlyRateCache = { at: Date.now(), since, data: entries };
+  return entries;
+}
+// Default aggregation granularity per window when the user picks "Auto": aim for
+// ~120 points, clamped to a sane [30s, 1h] range.
+function autoBucketMs(windowMs) {
+  return Math.min(3600000, Math.max(30000, Math.round(windowMs / 120 / 30000) * 30000 || 30000));
+}
+// `bucketMs` is the user-chosen aggregation granularity (0/undefined = Auto).
+async function getUsageRate(windowKey = '1h', metric = 'total', bucketMs = 0) {
+  loadRateSeries();
+  const windowMs = RATE_WINDOWS[windowKey] || RATE_WINDOWS['1h'];
+  const m = ['total', 'cost', 'output'].includes(metric) ? metric : 'total';
+  const now = Date.now();
+  const start = now - windowMs;
+  const effBucketMs = bucketMs && bucketMs > 0 ? bucketMs : autoBucketMs(windowMs);
+  // Fine, self-sampled rate over the whole window (covers only [firstSample, now]).
+  const points = rateSeries.computeRate(rateSeriesData, { windowMs, bucketMs: effBucketMs, metric: m, nowMs: now });
+  // Backfill: the self-sampled series only exists from when the app started sampling.
+  // For any bucket before the first sample (and always for 1d/1w), fill it from
+  // tokscale's hourly history so earlier-today / earlier-week usage still shows.
+  const firstSample = rateSeriesData.length ? rateSeriesData[0].t : Infinity;
+  const needHourly = windowKey === '1d' || windowKey === '1w' || firstSample > start;
+  if (needHourly) {
+    const entries = await fetchHourlyEntries(start);
+    const hourlyPts = rateSeries.hourlyToRate(entries, { sinceMs: start, untilMs: now, metric: m });
+    const byHour = new Map(hourlyPts.map((p) => [Math.floor(p.t / 3600000), p.value]));
+    const hourRateAt = (t) => byHour.get(Math.floor(t / 3600000)) || 0;
+    for (const pt of points) {
+      // Use the (flat) hourly rate for buckets that predate self-sampling.
+      if (pt.t < firstSample) pt.value = hourRateAt(pt.t);
+    }
+  }
+  return { window: windowKey, metric: m, bucketMs: effBucketMs, points };
+}
+// --- Custom pricing overrides (tokscale reads ~/.config/tokscale/custom-pricing.json) ---
+// Lets the user correct list prices or mark subscription-covered models as ~free.
+// Purely local — no network. tokscale reloads the file on each (per-tick) spawn.
+const PRICING_FIELDS = ['input_cost_per_million_tokens', 'output_cost_per_million_tokens', 'cache_read_input_token_cost_per_million_tokens', 'cache_creation_input_token_cost_per_million_tokens'];
+function customPricingPath() { return path.join(os.homedir(), '.config', 'tokscale', 'custom-pricing.json'); }
+function readCustomPricing() {
+  const raw = readJson(customPricingPath(), null);
+  return { models: raw && raw.models && typeof raw.models === 'object' ? raw.models : {} };
+}
+function writeCustomPricing(models) {
+  const clean = {};
+  for (const [id, v] of Object.entries(models || {})) {
+    if (!id || !v || typeof v !== 'object') continue;
+    const entry = {};
+    for (const f of PRICING_FIELDS) { const n = Number(v[f]); if (Number.isFinite(n) && n >= 0) entry[f] = n; }
+    // tokscale rejects an override unless input or output pricing is positive.
+    if (!(Number(entry.input_cost_per_million_tokens) > 0 || Number(entry.output_cost_per_million_tokens) > 0)) continue;
+    clean[id] = entry;
+  }
+  try { fs.mkdirSync(path.dirname(customPricingPath()), { recursive: true }); } catch (_) {}
+  writeJsonAtomic(customPricingPath(), { models: clean });
+  return { models: clean };
+}
+
+const providerTrayIcons = {};
+let registeredWindowToggleShortcut = '';
+let windowToggleShortcutRegistered = false;
+let defaultTrayIcon = null;
+let tokScaleNpmMetadata = null;
+let tokScaleUpdaterBusy = false;
+function getDefaultTrayIcon() {
+  if (!defaultTrayIcon) defaultTrayIcon = buildTrayIcon();
+  return defaultTrayIcon;
+}
+const AGENT_PID_PATH = pidFilePath();
+let embeddedHub = null;
+let embeddedHubError = null;
+let modeQueue = Promise.resolve();
+
+function effectiveHubConfig() {
+  if (settings?.hubMode === 'host') {
+    return {
+      url: `http://127.0.0.1:${normalizeHubPort(settings.hubHostPort)}`,
+      secret: settings.hubHostSecret || ''
+    };
+  }
+  if (settings?.hubMode === 'client') {
+    const url = String(settings.hubUrl || '').trim();
+    return { url: url || null, secret: settings.secret || '' };
+  }
+  return { url: null, secret: '' };
+}
+
+function hubDataFile() {
+  return path.join(app.getPath('userData'), 'hub-devices.json');
+}
+
+function sendHubPush(payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    try { mainWindow.webContents.send('hub:push', payload); } catch (_) {}
+  }
+}
+
+function getHubInfo() {
+  const port = normalizeHubPort(settings?.hubHostPort);
+  return {
+    mode: settings?.hubMode || 'local',
+    port,
+    secret: settings?.hubHostSecret || '',
+    listening: Boolean(embeddedHub),
+    listeningPort: embeddedHub ? embeddedHub.port : null,
+    error: embeddedHubError,
+    lanAddresses: lanIpv4Addresses()
+  };
+}
+
+async function startEmbeddedHub() {
+  if (embeddedHub) return embeddedHub;
+  embeddedHubError = null;
+  if (!settings.hubHostSecret) {
+    settings.hubHostSecret = generateHubSecret();
+    saveSettings();
+  }
+  const port = normalizeHubPort(settings.hubHostPort);
+  try {
+    const hub = createHub({
+      port,
+      host: '0.0.0.0',
+      secret: settings.hubHostSecret,
+      dataFile: hubDataFile(),
+      logger: { error: (err) => console.log(`[hub] ${err?.message || err}`) }
+    });
+    await hub.start();
+    embeddedHub = { hub, port };
+    console.log(`[hub] listening on 0.0.0.0:${port}`);
+    sendHubPush({ type: 'listening', info: getHubInfo() });
+    return embeddedHub;
+  } catch (error) {
+    embeddedHubError = { code: error.code || 'error', message: error.message, port };
+    console.log(`[hub] failed to start on port ${port}: ${error.message}`);
+    sendHubPush({ type: 'error', info: getHubInfo() });
+    return null;
+  }
+}
+
+async function stopEmbeddedHub() {
+  if (!embeddedHub) return;
+  const handle = embeddedHub;
+  embeddedHub = null;
+  try { await handle.hub.stop(); } catch (_) {}
+  sendHubPush({ type: 'stopped', info: getHubInfo() });
+}
+
+function isExternalAgentActive() {
+  try {
+    const raw = fs.readFileSync(AGENT_PID_PATH, 'utf8').trim();
+    const pid = parseInt(raw, 10);
+    if (!pid || pid === process.pid) return false;
+    process.kill(pid, 0);
+    return true;
+  } catch (_) { return false; }
+}
+
+async function deleteDeviceFromHub(deviceId) {
+  const { url: hubUrl, secret } = effectiveHubConfig();
+  if (!hubUrl) return;
+  const base = hubUrl.replace(/\/$/, '');
+  const response = await fetch(`${base}/api/devices/${encodeURIComponent(deviceId)}`, {
+    method: 'DELETE',
+    headers: secret ? { authorization: `Bearer ${secret}` } : {}
+  });
+  if (!response.ok && response.status !== 404) throw new Error(`DELETE ${response.status}`);
+}
+
+async function postToHub(summary) {
+  const { url: hubUrl, secret } = effectiveHubConfig();
+  if (!hubUrl) throw new Error('hub not configured');
+  const stale = settings.lastPostedDeviceId;
+  if (stale && stale !== summary.deviceId) {
+    try { await deleteDeviceFromHub(stale); }
+    catch (error) { console.log(`[sync] cleanup of old deviceId ${stale} failed: ${error.message}`); }
+  }
+  const url = `${hubUrl.replace(/\/$/, '')}/api/ingest`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(secret ? { authorization: `Bearer ${secret}` } : {}) },
+    body: JSON.stringify(summary)
+  });
+  if (!response.ok) throw new Error(`Hub ${response.status}: ${(await response.text()).slice(0, 200)}`);
+  if (settings.lastPostedDeviceId !== summary.deviceId) {
+    settings.lastPostedDeviceId = summary.deviceId;
+    saveSettings();
+  }
+  return response.json();
+}
+
+function stopSyncCollector() {
+  if (syncCollectorHandle) { try { syncCollectorHandle.stop(); } catch (_) {} }
+  syncCollectorHandle = null;
+}
+
+function startSyncCollector() {
+  stopSyncCollector();
+  if (!effectiveHubConfig().url) return;
+  syncCollectorHandle = startCollector({
+    clients: clientsCsvForSetting(settings.clients),
+    allTimeSince: settings.allTimeSince || '2024-01-01',
+    commandTimeoutMs: 120 * 1000,
+    deviceId: settings.deviceId || defaultDeviceId(),
+    agentVersion: appVersion(),
+    agentRuntime: 'electron-widget',
+    intervalMs: normalizeUsageRefreshMs(settings.usageRefreshMs),
+    claudeConfigDir: (settings.dataDirs && settings.dataDirs.claude) || '',
+    historyEnabled: settings.historyEnabled !== false,
+    historyIntervalMs: Number(process.env.TOKEN_MONITOR_HISTORY_INTERVAL_MS || 15 * 60 * 1000),
+    watchEnabled: true,
+    watchDebounceMs: 1500,
+    limitsEnabled: settings.limitsEnabled !== false,
+    limitProviders: settings.limitProviders ?? defaultLimitProviders(),
+    limitsRefreshMs: normalizeLimitsRefreshMs(settings.limitsRefreshMs),
+    opencodeCookie: settings.opencodeCookie || process.env.TOKEN_MONITOR_OPENCODE_COOKIE || '',
+    deepseekApiKey: settings.deepseekApiKey || '',
+    onUpdate: async (summary) => {
+      const visibleSummary = summaryWithArchivedClientUsage(summary);
+      sampleUsageRate(visibleSummary);
+      lastCollectedDevice = { ...visibleSummary, receivedAt: new Date().toISOString() };
+      if (isExternalAgentActive()) return;
+      try {
+        await postToHub(visibleSummary);
+      } catch (error) {
+        console.log(`[sync-collector] post failed: ${error.message}`);
+      }
+    },
+    onError: (error, reason) => console.log(`[sync-collector] ${reason}: ${error.message}`),
+    logger: (msg) => console.log(`[sync-collector] ${msg}`)
+  });
+}
+
+function isHubConfigured() {
+  return Boolean(effectiveHubConfig().url);
+}
+
+// Detection status is about this machine's local files, so stamp the freshly
+// collected local clientStatus onto the local device in whatever stats we hand the
+// renderer. This keeps the采集 tags correct in sync mode without depending on the
+// hub (or a remote Worker) being redeployed to preserve the field.
+function injectLocalClientStatus(stats) {
+  const status = lastCollectedDevice?.clientStatus;
+  if (!stats || !status || !Array.isArray(stats.devices)) return stats;
+  const device = stats.devices.find((entry) => entry.deviceId === lastCollectedDevice.deviceId);
+  if (device) device.clientStatus = status;
+  return stats;
+}
+
+function sendPush(payload) {
+  if (payload?.data?.stats) {
+    injectLocalClientStatus(payload.data.stats);
+    latestStats = payload.data.stats;
+    updateTrayDisplay();
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    try { mainWindow.webContents.send('stats:push', payload); } catch (_) {}
+  }
+}
+
+function updateTrayDisplay() {
+  if (!tray || tray.isDestroyed()) return;
+  const mode = settings?.trayContent || 'tokens';
+  const currency = normalizeCurrency(settings?.currency);
+  const text = formatTrayText(latestStats, mode, currency);
+  if (process.platform === 'darwin') tray.setTitle(text);
+  // Tooltip always shows a useful summary, even in icon-only mode where setTitle is blank.
+  const tip = formatTrayText(latestStats, 'both', currency);
+  tray.setToolTip(`Token Monitor - ${tip}`);
+  // Icon: rendered bars image in bar modes, otherwise the app icon.
+  let icon = null;
+  if ((mode === 'bars' || mode === 'barsSession' || mode === 'barsWeekly' || mode === 'barsAllSessions') && providerTrayIcons[mode]) {
+    icon = providerTrayIcons[mode];
+  } else {
+    const usageIconId = pickUsageTrayIconId(latestStats, mode, Object.keys(providerTrayIcons));
+    if (usageIconId) icon = providerTrayIcons[usageIconId];
+  }
+  tray.setImage(icon || getDefaultTrayIcon());
+}
+
+function sendStatus(connected, extra) {
+  streamConnected = Boolean(connected);
+  sendPush({ event: 'status', data: { connected: streamConnected, mode, ...(extra || {}) } });
+}
+
+function stopLocalCollector() {
+  if (localCollectorHandle) { try { localCollectorHandle.stop(); } catch (_) {} }
+  localCollectorHandle = null;
+  localDevice = null;
+  localStats = null;
+}
+
+function startLocalCollector() {
+  stopLocalCollector();
+  mode = 'local';
+  sendStatus(false, { reason: 'collecting' });
+  localCollectorHandle = startCollector({
+    clients: clientsCsvForSetting(settings.clients),
+    allTimeSince: settings.allTimeSince || '2024-01-01',
+    commandTimeoutMs: 120 * 1000,
+    deviceId: settings.deviceId || defaultDeviceId(),
+    agentVersion: appVersion(),
+    agentRuntime: 'electron-widget',
+    intervalMs: normalizeUsageRefreshMs(settings.usageRefreshMs),
+    claudeConfigDir: (settings.dataDirs && settings.dataDirs.claude) || '',
+    historyEnabled: settings.historyEnabled !== false,
+    historyIntervalMs: Number(process.env.TOKEN_MONITOR_HISTORY_INTERVAL_MS || 15 * 60 * 1000),
+    watchEnabled: true,
+    watchDebounceMs: 1500,
+    limitsEnabled: settings.limitsEnabled !== false,
+    limitProviders: settings.limitProviders ?? defaultLimitProviders(),
+    limitsRefreshMs: normalizeLimitsRefreshMs(settings.limitsRefreshMs),
+    opencodeCookie: settings.opencodeCookie || process.env.TOKEN_MONITOR_OPENCODE_COOKIE || '',
+    deepseekApiKey: settings.deepseekApiKey || '',
+    onUpdate: (summary, reason) => {
+      const visibleSummary = summaryWithArchivedClientUsage(summary);
+      sampleUsageRate(visibleSummary);
+      // History only rides along on gated ticks; carry the last known history
+      // forward so the trends dashboard doesn't blank out between them.
+      localDevice = carryDeviceHistory(localDevice, { ...visibleSummary, receivedAt: new Date().toISOString() });
+      lastCollectedDevice = localDevice;
+      localStats = withHistoryPreview(aggregateDevices([localDevice], 0), [localDevice]);
+      updateDiscordRpc(localStats, settings.currency);
+      sendPush({ event: 'stats', data: { type: 'stats', reason, stats: localStats, at: new Date().toISOString() } });
+      sendStatus(true, { reason });
+    },
+    onError: (error, reason) => {
+      sendStatus(false, { reason: `${reason}:${error.message}` });
+    },
+    logger: (msg) => console.log(`[collector] ${msg}`)
+  });
+}
+
+function scheduleStreamRetry(delayMs = 3000) {
+  if (sseRetryTimer) return;
+  sseRetryTimer = setTimeout(() => { sseRetryTimer = null; startStatsStream(); }, delayMs);
+}
+
+function stopStatsStream() {
+  if (sseAbortController) { try { sseAbortController.abort(); } catch (_) {} }
+  sseAbortController = null;
+  if (sseRetryTimer) { clearTimeout(sseRetryTimer); sseRetryTimer = null; }
+}
+
+function parseSseChunk(chunk) {
+  let event = 'message';
+  const dataLines = [];
+  for (const line of chunk.split('\n')) {
+    if (!line || line.startsWith(':')) continue;
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+  }
+  if (dataLines.length === 0) return null;
+  try { return { event, data: JSON.parse(dataLines.join('\n')) }; } catch (_) { return null; }
+}
+
+async function startStatsStream() {
+  stopStatsStream();
+  const { url: hubUrl, secret } = effectiveHubConfig();
+  if (!hubUrl) return;
+  mode = 'sync';
+  const url = `${hubUrl.replace(/\/$/, '')}/api/stats/stream`;
+  const controller = new AbortController();
+  sseAbortController = controller;
+  try {
+    const response = await fetch(url, {
+      headers: { accept: 'text/event-stream', ...(secret ? { authorization: `Bearer ${secret}` } : {}) },
+      signal: controller.signal
+    });
+    if (!response.ok || !response.body) {
+      sendStatus(false, { code: response.status });
+      scheduleStreamRetry();
+      return;
+    }
+    sendStatus(true);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf('\n\n')) !== -1) {
+        const chunk = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const parsed = parseSseChunk(chunk);
+        if (parsed) {
+          if (parsed.event === 'stats' && parsed.data?.stats) updateDiscordRpc(parsed.data.stats, settings.currency);
+          sendPush(parsed);
+        }
+      }
+    }
+    sendStatus(false, { reason: 'eof' });
+    scheduleStreamRetry();
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    sendStatus(false, { reason: error.message });
+    scheduleStreamRetry();
+  }
+}
+
+function showPopover() {
+  if (!mainWindow || mainWindow.isDestroyed() || !tray) return;
+  applyMacActivationPolicy();
+  applyWindowSettings();
+  const current = mainWindow.getBounds();
+  const target = popoverBounds(tray, current.width, current.height);
+  mainWindow.setBounds(target);
+  suppressNextBlurHide = true;
+  mainWindow.show();
+  mainWindow.focus();
+  // The focus event itself may not fire a blur; the suppress flag covers the
+  // case where macOS fires blur immediately after show because the click that
+  // opened us still has the menu bar as the focused element.
+  setTimeout(() => { suppressNextBlurHide = false; }, 250);
+}
+
+function hidePopover() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isVisible()) mainWindow.hide();
+}
+
+function togglePopover() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isVisible() && mainWindow.isFocused()) hidePopover();
+  else showPopover();
+}
+
+function focusExistingWindow() {
+  applyMacActivationPolicy({ mainWindowVisible: true });
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  if (settings?.trayMode) showPopover();
+  else if (floatingBubbleState.collapsed) expandFloatingBubble();
+  else {
+    mainWindow.show();
+    mainWindow.focus();
+  }
+}
+
+function currentWindowToggleShortcutStatus() {
+  const shortcut = normalizeWindowToggleShortcut(settings?.windowToggleShortcut);
+  const registered = windowToggleShortcutRegistered && registeredWindowToggleShortcut === shortcut;
+  return windowToggleShortcutStatus(shortcut, registered);
+}
+
+function settingsForRenderer() {
+  const deepseekApiKeySource = settings?.deepseekApiKey
+    ? 'settings'
+    : deepseekToken(process.env)
+      ? 'env'
+      : '';
+  return {
+    ...settings,
+    deepseekApiKey: '',
+    deepseekApiKeyConfigured: Boolean(currentDeepSeekApiKey()),
+    deepseekApiKeySource,
+    windowToggleShortcutStatus: currentWindowToggleShortcutStatus()
+  };
+}
+
+function pushSettingsToRenderer() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try { mainWindow.webContents.send('settings:push', settingsForRenderer()); } catch (_) {}
+}
+
+function unregisterWindowToggleShortcut() {
+  if (registeredWindowToggleShortcut) {
+    try { globalShortcut.unregister(registeredWindowToggleShortcut); } catch (_) {}
+  }
+  registeredWindowToggleShortcut = '';
+  windowToggleShortcutRegistered = false;
+}
+
+function handleWindowToggleShortcut() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const action = windowToggleShortcutAction({
+    trayMode: Boolean(settings?.trayMode),
+    floatingBubbleCollapsed: Boolean(floatingBubbleState.collapsed),
+    visible: mainWindow.isVisible(),
+    minimized: typeof mainWindow.isMinimized === 'function' ? mainWindow.isMinimized() : false
+  });
+  if (action === 'togglePopover') togglePopover();
+  else if (action === 'expandFloatingBubble') expandFloatingBubble();
+  else if (action === 'hideWindow') mainWindow.hide();
+  else focusExistingWindow();
+}
+
+function handleTrayToggle() {
+  const action = trayToggleAction(settings);
+  if (action === 'togglePopover') togglePopover();
+  else if (action === 'focusWindow') focusExistingWindow();
+}
+
+function configureWindowToggleShortcut() {
+  unregisterWindowToggleShortcut();
+  const shortcut = normalizeWindowToggleShortcut(settings?.windowToggleShortcut);
+  settings.windowToggleShortcut = shortcut;
+  if (!shortcut || !app.isReady()) return false;
+  try {
+    windowToggleShortcutRegistered = globalShortcut.register(shortcut, handleWindowToggleShortcut);
+    if (windowToggleShortcutRegistered) {
+      registeredWindowToggleShortcut = shortcut;
+      return true;
+    }
+  } catch (error) {
+    console.log(`[shortcut] failed to register ${shortcut}: ${error.message}`);
+    return false;
+  }
+  console.log(`[shortcut] failed to register ${shortcut}`);
+  return false;
+}
+
+function ensureTray() {
+  if (!shouldCreateTray(settings)) return false;
+  if (tray && !tray.isDestroyed()) return;
+  tray = createTray({
+    onToggle: handleTrayToggle,
+    onQuit: requestAppQuit,
+    onSwitchToWindowMode: () => {
+      settings.trayMode = false;
+      saveSettings();
+      exitTrayMode();
+      pushSettingsToRenderer();
+    }
+  });
+  updateTrayDisplay();
+  return true;
+}
+
+function destroyTray() {
+  if (tray && !tray.isDestroyed()) tray.destroy();
+  tray = null;
+}
+
+function enterTrayMode() {
+  applyMacActivationPolicy();
+  ensureTray();
+  updateTrayDisplay();
+  applyWindowSettings();
+  applyMacActivationPolicy();
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (typeof mainWindow.setSkipTaskbar === 'function') mainWindow.setSkipTaskbar(true);
+    // Without this, .show() yanks the user back to the Space the window was last
+    // shown on instead of popping over the current Space / fullscreen app.
+    if (typeof mainWindow.setVisibleOnAllWorkspaces === 'function') {
+      mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    }
+    mainWindow.hide();
+  }
+}
+
+function exitTrayMode() {
+  applyMacActivationPolicy({ mainWindowVisible: true });
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (typeof mainWindow.setSkipTaskbar === 'function') mainWindow.setSkipTaskbar(false);
+    if (typeof mainWindow.setVisibleOnAllWorkspaces === 'function') {
+      mainWindow.setVisibleOnAllWorkspaces(false);
+    }
+    const restore = restoredBounds() || DEFAULT_WINDOW;
+    mainWindow.setBounds({
+      width: restore.width,
+      height: restore.height,
+      ...(typeof restore.x === 'number' ? { x: restore.x, y: restore.y } : {})
+    });
+    applyWindowSettings();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+  if (!shouldCreateTray(settings)) destroyTray();
+  else ensureTray();
+}
+
+function startMode() {
+  // Tear down collectors synchronously so they can't double-run while the
+  // async reconciliation below is queued.
+  stopLocalCollector();
+  stopStatsStream();
+  stopSyncCollector();
+  // Serialize the hub-side work so rapid UI events (mode change immediately
+  // followed by a port edit or secret regenerate) reconcile in order rather
+  // than racing — otherwise an in-flight start could finish with the old
+  // port/secret after the UI already advertises the new ones.
+  modeQueue = modeQueue.then(async () => {
+    if (settings.hubMode === 'host') {
+      await stopEmbeddedHub();
+      const handle = await startEmbeddedHub();
+      if (settings.hubMode !== 'host') {
+        await stopEmbeddedHub();
+        return;
+      }
+      if (!handle) {
+        // Bind failed (e.g. EADDRINUSE). The error is already surfaced via
+        // hub:push; fall back to the local collector so the widget still
+        // shows data while the user fixes the port.
+        startLocalCollector();
+        return;
+      }
+      startStatsStream();
+      startSyncCollector();
+      return;
+    }
+    await stopEmbeddedHub();
+    if (effectiveHubConfig().url) {
+      startStatsStream();
+      startSyncCollector();
+    } else {
+      startLocalCollector();
+    }
+  }).catch((err) => {
+    console.log(`[mode] reconciliation failed: ${err?.message || err}`);
+  });
+}
+
+function stopAll() {
+  stopPersistBoundsTimer();
+  stopLocalCollector();
+  stopStatsStream();
+  stopSyncCollector();
+  void stopEmbeddedHub();
+  stopDiscordRpc();
+  if (tray && !tray.isDestroyed()) tray.destroy();
+  tray = null;
+}
+
+let quitRequested = false;
+function requestAppQuit() {
+  if (quitRequested) return;
+  quitRequested = true;
+  stopAll();
+  if (app.isReady()) app.quit();
+  else app.exit(0);
+}
+
+async function fetchStats(options = {}) {
+  const force = Boolean(options?.force);
+  const tickOptions = force ? { forceLimits: true } : {};
+  if (mode === 'local') {
+    if (force && localCollectorHandle) await localCollectorHandle.tick('manual', tickOptions);
+    if (localStats) return localStats;
+    return withHistoryPreview(aggregateDevices(localDevice ? [localDevice] : [], 0), localDevice ? [localDevice] : []);
+  }
+  if (force && syncCollectorHandle && !isExternalAgentActive()) {
+    await syncCollectorHandle.tick('manual', tickOptions);
+  }
+  const { url: hubUrl, secret } = effectiveHubConfig();
+  if (!hubUrl) return withHistoryPreview(aggregateDevices([], 0), []);
+  const url = `${hubUrl.replace(/\/$/, '')}/api/stats`;
+  const response = await fetch(url, { headers: secret ? { authorization: `Bearer ${secret}` } : {} });
+  if (!response.ok) throw new Error(`Hub ${response.status}: ${(await response.text()).slice(0, 200)}`);
+  return injectLocalClientStatus(await response.json());
+}
+
+function stripTokscaleMetadata(result) {
+  if (!result || typeof result !== 'object') return result;
+  const { metadata: _metadata, ...publicResult } = result;
+  return publicResult;
+}
+
+function sendTokscalePush(payload) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try { mainWindow.webContents.send('tokscale:push', payload); } catch (_) {}
+}
+
+async function checkTokscaleNpm({ silent = false } = {}) {
+  try {
+    const result = await checkNpmForNewer(app.getVersion());
+    if (result.metadata) tokScaleNpmMetadata = result.metadata;
+    const publicResult = stripTokscaleMetadata(result);
+    sendTokscalePush({ type: 'check', ...publicResult });
+    return publicResult;
+  } catch (error) {
+    if (silent) {
+      console.log(`[tokscale] npm check failed: ${error.message}`);
+      return { supported: true, error: null, silent: true };
+    }
+    return { supported: true, error: error.message };
+  }
+}
+
+async function downloadTokscaleFromNpm() {
+  if (tokScaleUpdaterBusy) return { supported: true, busy: true };
+  tokScaleUpdaterBusy = true;
+  try {
+    if (!tokScaleNpmMetadata) {
+      const checked = await checkNpmForNewer(app.getVersion());
+      if (!checked.supported) return { supported: false };
+      tokScaleNpmMetadata = checked.metadata;
+    }
+    const result = await downloadFromNpm(tokScaleNpmMetadata);
+    const publicResult = stripTokscaleMetadata(result);
+    sendTokscalePush({ type: 'download', ...publicResult });
+    return publicResult;
+  } catch (error) {
+    return { supported: true, error: error.message };
+  } finally {
+    tokScaleUpdaterBusy = false;
+  }
+}
+
+const APP_UPDATE_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+let appUpdateCheckInFlight = false;
+let appUpdateLastError = null;
+
+function deriveAppUpdateState() {
+  const block = settings?.appUpdate || {};
+  const currentVersion = app.getVersion();
+  const latest = block.lastKnownLatest || null;
+  const dismissedVersion = block.dismissedVersion || null;
+  let hasUpdate = false;
+  if (latest && semver.valid(latest.version) && semver.valid(currentVersion)) {
+    hasUpdate = semver.gt(latest.version, currentVersion) && latest.version !== dismissedVersion;
+  }
+  return {
+    currentVersion,
+    latest,
+    hasUpdate,
+    dismissedVersion,
+    lastCheckedAt: block.lastCheckedAt || null,
+    checking: appUpdateCheckInFlight,
+    lastError: appUpdateLastError
+  };
+}
+
+function sendAppUpdatePush() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send('appUpdate:push', deriveAppUpdateState());
+}
+
+async function runAppUpdateCheck({ force = false } = {}) {
+  if (appUpdateCheckInFlight) return deriveAppUpdateState();
+  const block = settings?.appUpdate || {};
+  if (!force && block.lastCheckedAt) {
+    const last = Date.parse(block.lastCheckedAt);
+    if (Number.isFinite(last) && Date.now() - last < APP_UPDATE_COOLDOWN_MS) {
+      return deriveAppUpdateState();
+    }
+  }
+  appUpdateCheckInFlight = true;
+  appUpdateLastError = null;
+  if (force) sendAppUpdatePush();
+  try {
+    const result = await checkLatestRelease(app.getVersion());
+    if (result.ok) {
+      settings.appUpdate = {
+        ...(settings.appUpdate || {}),
+        lastCheckedAt: result.checkedAt,
+        lastKnownLatest: result.latest
+      };
+      saveSettings();
+      appUpdateLastError = null;
+    } else {
+      appUpdateLastError = force ? (result.error || 'Update check failed') : null;
+      if (!force) console.warn('App update check failed:', result.error);
+    }
+  } catch (error) {
+    appUpdateLastError = force ? (error.message || String(error)) : null;
+    if (!force) console.warn('App update check threw:', error);
+  } finally {
+    appUpdateCheckInFlight = false;
+    sendAppUpdatePush();
+  }
+  return deriveAppUpdateState();
+}
+
+function maybeRunBackgroundUpdateCheck() {
+  runAppUpdateCheck({ force: false }).catch(() => {});
+}
+
+function dismissAppUpdateVersion(version) {
+  if (typeof version !== 'string' || !version) return deriveAppUpdateState();
+  settings.appUpdate = {
+    ...(settings.appUpdate || {}),
+    dismissedVersion: version
+  };
+  saveSettings();
+  sendAppUpdatePush();
+  return deriveAppUpdateState();
+}
+
+function isAllowedExternalUrl(value) {
+  let parsed;
+  try { parsed = new URL(String(value || '')); }
+  catch (_) { return false; }
+  if (parsed.protocol !== 'https:') return false;
+  if (parsed.hostname === 'github.com' && parsed.pathname.startsWith('/junhoyeo/tokscale')) return true;
+  if (parsed.hostname === 'www.npmjs.com' && parsed.pathname.startsWith('/package/@tokscale/')) return true;
+  if (parsed.hostname === 'github.com' && parsed.pathname.startsWith('/Javis603/token-monitor')) return true;
+  if ((parsed.hostname === 'cursor.com' || parsed.hostname === 'www.cursor.com') && parsed.pathname.startsWith('/settings')) return true;
+  if (parsed.hostname === 'opencode.ai' || parsed.hostname === 'www.opencode.ai') return true;
+  if (parsed.hostname === 'platform.deepseek.com' && parsed.pathname.startsWith('/api_keys')) return true;
+  if (STATUS_PAGE_HOSTS.has(parsed.hostname) && (parsed.pathname === '' || parsed.pathname === '/')) return true;
+  return false;
+}
+
+function revealWindow(target = mainWindow, options = {}) {
+  if (!target || target.isDestroyed() || target.isVisible()) return;
+  const inactive = options.inactive === true || (target === mainWindow && floatingBubbleState.collapsed);
+  if (inactive && typeof target.showInactive === 'function') {
+    target.showInactive();
+    return;
+  }
+  target.show();
+}
+
+function loadWindowFile(target, options = {}) {
+  let revealed = false;
+  const reveal = () => {
+    if (revealed) return;
+    revealed = true;
+    if (settings?.trayMode) return; // stay hidden until tray click
+    revealWindow(target, { inactive: options.inactive === true });
+  };
+  const waitForContent = options.waitForContent === true;
+  const onContentReady = (event) => {
+    if (event.sender === target.webContents) reveal();
+  };
+  const fallbackTimer = setTimeout(reveal, 2500);
+  const cleanup = () => {
+    clearTimeout(fallbackTimer);
+    ipcMain.removeListener('window:contentReady', onContentReady);
+  };
+  target.once('show', cleanup);
+  target.once('closed', cleanup);
+  if (waitForContent) {
+    // A recreated window paints its static "0" defaults before the renderer's
+    // async stats fetch resolves; revealing on load would flash empty content.
+    // Wait until the renderer reports it has rendered real data instead.
+    ipcMain.on('window:contentReady', onContentReady);
+    target.webContents.once('did-finish-load', () => applyZoomFactor(target));
+  } else {
+    target.once('ready-to-show', reveal);
+    target.webContents.once('did-finish-load', () => {
+      applyZoomFactor(target);
+      reveal();
+    });
+  }
+  target.webContents.once('did-fail-load', (_event, code, description) => {
+    console.log(`[window] renderer load failed: ${code} ${description}`);
+    reveal();
+  });
+  const filePath = path.join(__dirname, 'renderer', 'index.html');
+  const load = options.query ? target.loadFile(filePath, { query: options.query }) : target.loadFile(filePath);
+  load.catch((error) => {
+    console.log(`[window] renderer load failed: ${error.message}`);
+    reveal();
+  });
+}
+
+function createWindow(boundsOverride, options = {}) {
+  ensureSettingsLoaded();
+  const collapsedFloatingBubble = options.collapsedFloatingBubble === true;
+  const glass = nativeBlurEnabled();
+  const bounds = boundsOverride || restoredBounds() || DEFAULT_WINDOW;
+  const collapsedSizeLimits = {
+    minWidth: bounds.width,
+    minHeight: bounds.height,
+    maxWidth: bounds.width,
+    maxHeight: bounds.height
+  };
+  const win = new BrowserWindow({
+    width: bounds.width,
+    height: bounds.height,
+    ...(typeof bounds.x === 'number' ? { x: bounds.x, y: bounds.y } : {}),
+    ...(collapsedFloatingBubble ? collapsedSizeLimits : WINDOW_LIMITS),
+    frame: false,
+    transparent: !(process.platform === 'win32' && glass),
+    resizable: !collapsedFloatingBubble,
+    show: false,
+    backgroundColor: '#00000000',
+    icon: APP_ICON_PATH,
+    skipTaskbar: collapsedFloatingBubble || Boolean(settings?.trayMode),
+    ...(collapsedFloatingBubble ? { fullscreenable: false, maximizable: false, minimizable: false } : {}),
+    ...floatingBubbleWindowChrome(process.platform, collapsedFloatingBubble),
+    ...(process.platform === 'darwin' && glass ? { vibrancy: 'hud', visualEffectState: 'active' } : {}),
+    ...(process.platform === 'win32' && glass ? { backgroundMaterial: 'acrylic' } : {}),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+  mainWindow = win;
+  mainWindowChrome = { collapsedFloatingBubble };
+  applyWindowsChrome(win, { round: !collapsedFloatingBubble });
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (isAllowedExternalUrl(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  win.webContents.on('will-navigate', (event, url) => {
+    event.preventDefault();
+    if (isAllowedExternalUrl(url)) shell.openExternal(url);
+  });
+  applyWindowSettings();
+  applyNativeMaterial();
+  keepNativeBlurActive();
+  win.on('focus', () => {
+    stopFloatingBubbleAutoCollapseTimer();
+    keepNativeBlurActive();
+  });
+  win.on('blur', () => {
+    keepNativeBlurActive();
+    if (settings?.trayMode && !suppressNextBlurHide && !quitRequested) hidePopover();
+    else if (!quitRequested) scheduleFloatingBubbleAutoCollapse();
+  });
+  win.on('resized', persistBoundsSoon);
+  win.on('moved', persistBoundsSoon);
+  win.on('close', (event) => {
+    if (quitRequested) return;
+    const action = mainWindowCloseAction(settings, { platform: process.platform });
+    if (action === 'hidePopover') {
+      event.preventDefault();
+      hidePopover();
+    } else if (action === 'hideWindow') {
+      event.preventDefault();
+      win.hide();
+      applyMacActivationPolicy({ mainWindowVisible: false });
+    }
+  });
+  win.webContents.on('before-input-event', handleZoomShortcut);
+  win.webContents.once('did-finish-load', sendFloatingBubbleState);
+  loadWindowFile(win, {
+    waitForContent: options.waitForContent === true,
+    inactive: options.inactive === true,
+    query: floatingBubbleInitialRendererQuery(floatingBubbleState, {
+      collapsedWindow: collapsedFloatingBubble,
+      suppressInitialNumberAnimation: options.suppressInitialNumberAnimation === true,
+      viewState: rendererViewState
+    })
+  });
+}
+
+function handleZoomShortcut(event, input) {
+  if (input.type !== 'keyDown') return;
+  const key = input.key;
+  if (key === 'Escape' && !input.control && !input.meta && !input.alt && !input.shift && canUseFloatingBubble(settings)) {
+    event.preventDefault();
+    maybeCollapseFloatingBubble(mainWindow.getBounds());
+    return;
+  }
+  if (!(input.control || input.meta)) return;
+  if (key === '=' || key === '+') { event.preventDefault(); adjustZoom(ZOOM_LIMITS.step); }
+  else if (key === '-' || key === '_') { event.preventDefault(); adjustZoom(-ZOOM_LIMITS.step); }
+  else if (key === '0') { event.preventDefault(); setZoomFactor(1); }
+}
+
+function replaceMainWindow(bounds, options = {}) {
+  const old = mainWindow;
+  const wasFocused = old && !old.isDestroyed() ? old.isFocused() : false;
+  if (old && !old.isDestroyed()) old.removeAllListeners('close');
+  // Build the new window first so total window count never drops to 0
+  // (otherwise window-all-closed fires and quits the app on Windows).
+  createWindow(bounds, {
+    collapsedFloatingBubble: options.collapsedFloatingBubble === true,
+    suppressInitialNumberAnimation: options.suppressInitialNumberAnimation === true,
+    waitForContent: options.waitForContent === true,
+    inactive: options.inactive === true
+  });
+  const next = mainWindow;
+  next.once('show', () => {
+    if (old && !old.isDestroyed()) old.destroy();
+    if ((options.focus === true || (options.focus !== false && wasFocused)) && !next.isDestroyed()) {
+      next.focus();
+    }
+  });
+}
+
+function createDashboardWindow() {
+  if (dashboardWindow && !dashboardWindow.isDestroyed()) {
+    // Reload so a reopened window always picks up the latest renderer + fresh history,
+    // instead of showing whatever was loaded when it first opened.
+    dashboardWindow.webContents.reload();
+    dashboardWindow.focus();
+    return dashboardWindow;
+  }
+  const glass = nativeBlurEnabled();
+  const win = new BrowserWindow({
+    width: 920,
+    height: 620,
+    minWidth: 560,
+    minHeight: 420,
+    frame: false,
+    transparent: !(process.platform === 'win32' && glass),
+    show: false,
+    backgroundColor: '#00000000',
+    icon: APP_ICON_PATH,
+    skipTaskbar: false,
+    ...(process.platform === 'darwin' && glass ? { vibrancy: 'hud', visualEffectState: 'active' } : {}),
+    ...(process.platform === 'win32' && glass ? { backgroundMaterial: 'acrylic' } : {}),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+  dashboardWindow = win;
+  applyWindowsChrome(win, { round: true });
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (isAllowedExternalUrl(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  win.webContents.on('will-navigate', (event, url) => {
+    event.preventDefault();
+    if (isAllowedExternalUrl(url)) shell.openExternal(url);
+  });
+  win.once('ready-to-show', () => win.show());
+  win.on('closed', () => { dashboardWindow = null; });
+  win.loadFile(path.join(__dirname, 'renderer', 'dashboard.html'))
+    .catch((error) => console.log(`[dashboard] load failed: ${error.message}`));
+  return win;
+}
+
+async function getDashboardHistory() {
+  if (settings?.historyEnabled === false) return aggregateHistory([], 0);
+  if (mode === 'local') {
+    // The local collector keeps localDevice.history current (watch + interval
+    // ticks, with carry-forward), so read it directly — exactly as the hub
+    // branch reads /api/history. Forcing a full collection tick here made the
+    // fetch take seconds; on a quick close/reopen the response outlived the
+    // renderer and was dropped, stranding the dashboard on its empty state.
+    return aggregateHistory(localDevice ? [localDevice] : [], 0);
+  }
+  const { url: hubUrl, secret } = effectiveHubConfig();
+  if (!hubUrl) return aggregateHistory([], 0);
+  const url = `${hubUrl.replace(/\/$/, '')}/api/history`;
+  const response = await fetch(url, { headers: secret ? { authorization: `Bearer ${secret}` } : {} });
+  if (!response.ok) throw new Error(`Hub ${response.status}: ${(await response.text()).slice(0, 200)}`);
+  return response.json();
+}
+
+let cursorStatusCache = { value: null, at: 0 };
+let opencodeStatusCache = { value: null, at: 0 };
+const CURSOR_STATUS_TTL_MS = 30 * 1000;
+
+function currentOpenCodeCookie() {
+  return settings?.opencodeCookie || process.env.TOKEN_MONITOR_OPENCODE_COOKIE || '';
+}
+
+async function readOpenCodeStatus() {
+  const cookie = currentOpenCodeCookie();
+  if (!cookie) return { linked: false };
+  // Probe both sources so a Go-only cookie isn't judged solely by Zen (and vice
+  // versa). Both fetchers swallow their own errors, so Promise.all won't reject.
+  const [go, zen] = await Promise.all([
+    opencodeWeb.fetchGoWeb(cookie, {}),
+    opencodeWeb.fetchZen(cookie, {})
+  ]);
+  const summary = opencodeWeb.summarizeLink(go, zen);
+  if (summary.expired) return { ...summary, error: 'OpenCode cookie expired' };
+  return summary;
+}
+
+function normalizeManualCookie(input) {
+  let s = String(input || '').trim();
+  if (!s) return '';
+  if (s.toLowerCase().startsWith('cookie:')) s = s.slice(7).trim();
+  // If they pasted the full cookie header, extract the WorkosCursorSessionToken= value.
+  const match = s.match(/WorkosCursorSessionToken=([^;\s]+)/);
+  if (match) return match[1];
+  // Otherwise assume the whole string is the raw token value.
+  if (/\s/.test(s)) return '';
+  return s;
+}
+
+function rebuildWindow() {
+  if (!mainWindow) return;
+  const bounds = floatingBubbleState.collapsed && floatingBubbleState.expandedBounds
+    ? floatingBubbleState.expandedBounds
+    : mainWindow.getBounds();
+  const wasFocused = mainWindow.isFocused();
+  const old = mainWindow;
+  floatingBubbleState.collapsed = false;
+  floatingBubbleState.side = null;
+  floatingBubbleState.collapsedBounds = null;
+  floatingBubbleState.expandedBounds = null;
+  floatingBubbleState.suppressNextCollapse = false;
+  stopFloatingBubbleAutoCollapseTimer();
+  old.removeAllListeners('close');
+  // Build the new window first so total window count never drops to 0
+  // (otherwise window-all-closed fires and quits the app on Windows).
+  createWindow(bounds);
+  mainWindow.once('show', () => {
+    if (!old.isDestroyed()) old.destroy();
+    if (wasFocused && !mainWindow.isDestroyed()) mainWindow.focus();
+  });
+}
+
+app.whenReady().then(() => {
+  if (process.platform === 'darwin' && app.dock) app.dock.setIcon(APP_ICON_PATH);
+  ensureSettingsLoaded();
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    callback({
+      responseHeaders: {
+        ...details.responseHeaders,
+        'Content-Security-Policy': [CSP_HEADER]
+      }
+    });
+  });
+  applyMacActivationPolicy();
+  createWindow();
+  syncLoginItemSettingFromOs();
+  configureWindowToggleShortcut();
+  cleanupStaleStaging().catch((error) => console.log(`[tokscale] staging cleanup failed: ${error.message}`));
+  ensureTray();
+  if (settings.trayMode) enterTrayMode();
+  startMode();
+  if (settings.discordRpcEnabled) startDiscordRpc();
+  setTimeout(() => { checkTokscaleNpm({ silent: true }); }, 2000);
+  ipcMain.handle('settings:get', () => settingsForRenderer());
+  ipcMain.handle('settings:update', (_event, patch) => {
+    const previousNativeMaterial = nativeBlurEnabled();
+    const previousHubMode = settings.hubMode;
+    const previousHubHostPort = settings.hubHostPort;
+    const previousHubHostSecret = settings.hubHostSecret;
+    const previousHubUrl = settings.hubUrl;
+    const previousSecret = settings.secret;
+    const previousDeviceId = settings.deviceId;
+    const previousClients = settings.clients;
+    const previousLimitsEnabled = settings.limitsEnabled;
+    const previousLimitProviders = settings.limitProviders;
+    const previousLimitsRefreshMs = settings.limitsRefreshMs;
+    const previousUsageRefreshMs = settings.usageRefreshMs;
+    const previousDataDirs = JSON.stringify(settings.dataDirs || {});
+    const previousHistoryEnabled = settings.historyEnabled;
+    const previousDeepSeekApiKey = settings.deepseekApiKey;
+    const previousDiscordRpcEnabled = settings.discordRpcEnabled;
+    const previousShowTrayIcon = settings.showTrayIcon;
+    const previousTrayMode = settings.trayMode;
+    const previousTrayContent = settings.trayContent;
+    const previousCurrency = settings.currency;
+    const previousStartAtLogin = settings.startAtLogin;
+    const normalizedCurrency = patch.currency !== undefined ? normalizeCurrency(patch.currency, settings.currency) : normalizeCurrency(settings.currency);
+    const normalizedPatch = { ...patch, currency: normalizedCurrency };
+    if (patch.clients !== undefined) normalizedPatch.clients = clientsCsvForSetting(patch.clients, '');
+    if (patch.deepseekApiKey !== undefined) normalizedPatch.deepseekApiKey = normalizeDeepSeekApiKey(patch.deepseekApiKey);
+    settings = normalizeWindowBehaviorSettings({
+      ...settings,
+      ...normalizedPatch,
+      hubMode: patch.hubMode !== undefined ? normalizeHubMode(patch.hubMode, settings.hubMode) : settings.hubMode,
+      hubHostPort: patch.hubHostPort !== undefined ? normalizeHubPort(patch.hubHostPort, settings.hubHostPort) : settings.hubHostPort,
+      hubHostSecret: patch.hubHostSecret !== undefined ? String(patch.hubHostSecret) : settings.hubHostSecret,
+      deviceId: (patch.deviceId !== undefined ? String(patch.deviceId).trim() : settings.deviceId) || defaultDeviceId(),
+      clients: patch.clients !== undefined ? clientsCsvForSetting(patch.clients, '') : clientsCsvForSetting(settings.clients, DEFAULT_CLIENTS),
+      refreshMs: Math.max(5000, Number(patch.refreshMs ?? settings.refreshMs ?? 15000)),
+      usageRefreshMs: normalizeUsageRefreshMs(patch.usageRefreshMs ?? settings.usageRefreshMs),
+      numberAnimation: parseBoolean(patch.numberAnimation ?? settings.numberAnimation, true),
+      alwaysOnTopAboveAll: parseBoolean(patch.alwaysOnTopAboveAll ?? settings.alwaysOnTopAboveAll, false),
+      modelSortByCost: parseBoolean(patch.modelSortByCost ?? settings.modelSortByCost, false),
+      dailyBudget: Math.max(0, Number(patch.dailyBudget ?? settings.dailyBudget ?? 0)) || 0,
+      monthlyBudget: Math.max(0, Number(patch.monthlyBudget ?? settings.monthlyBudget ?? 0)) || 0,
+      dataDirs: patch.dataDirs !== undefined ? normalizeDataDirs(patch.dataDirs) : normalizeDataDirs(settings.dataDirs),
+      glassOpacity: Math.max(0, Math.min(100, Number(patch.glassOpacity ?? settings.glassOpacity ?? 68))),
+      glassBlur: Math.max(0, Math.min(100, Number(patch.glassBlur ?? settings.glassBlur ?? 32))),
+      systemGlass: patch.systemGlass ?? settings.systemGlass ?? true,
+      showLiveDot: patch.showLiveDot ?? settings.showLiveDot ?? true,
+      showToolIcons: patch.showToolIcons ?? settings.showToolIcons ?? true,
+      titleIconOnly: parseBoolean(patch.titleIconOnly ?? settings.titleIconOnly, false),
+      floatingBubbleEnabled: parseBoolean(patch.floatingBubbleEnabled ?? settings.floatingBubbleEnabled, false),
+      discordRpcEnabled: patch.discordRpcEnabled ?? settings.discordRpcEnabled ?? false,
+      limitsEnabled: parseBoolean(patch.limitsEnabled ?? settings.limitsEnabled, true),
+      limitProviders: patch.limitProviders !== undefined ? parseLimitProviders(patch.limitProviders).join(',') : settings.limitProviders,
+      limitProviderOrder: patch.limitProviderOrder !== undefined ? migrateLimitProviderOrder(patch.limitProviderOrder) : settings.limitProviderOrder,
+      clientDisplayOrder: patch.clientDisplayOrder !== undefined ? migrateClientDisplayOrder(patch.clientDisplayOrder) : (settings.clientDisplayOrder || ''),
+      hiddenClients: patch.hiddenClients !== undefined ? normalizeHiddenClients(patch.hiddenClients, DEFAULT_CLIENT_LIST) : normalizeHiddenClients(settings.hiddenClients, DEFAULT_CLIENT_LIST),
+      pinnedClients: patch.pinnedClients !== undefined ? normalizePinnedClients(patch.pinnedClients, DEFAULT_CLIENT_LIST) : normalizePinnedClients(settings.pinnedClients, DEFAULT_CLIENT_LIST),
+      viewDisplayOrder: patch.viewDisplayOrder !== undefined ? migrateViewDisplayOrder(patch.viewDisplayOrder) : (settings.viewDisplayOrder || ''),
+      hiddenViews: patch.hiddenViews !== undefined ? normalizeHiddenViews(patch.hiddenViews, DEFAULT_VIEW_LIST) : normalizeHiddenViews(settings.hiddenViews, DEFAULT_VIEW_LIST),
+      historyEnabled: parseBoolean(patch.historyEnabled ?? settings.historyEnabled, false),
+      serviceProviderDisplayOrder: patch.serviceProviderDisplayOrder !== undefined ? String(patch.serviceProviderDisplayOrder || '') : (settings.serviceProviderDisplayOrder || ''),
+      hiddenServiceProviders: patch.hiddenServiceProviders !== undefined ? String(patch.hiddenServiceProviders || '') : (settings.hiddenServiceProviders || ''),
+      serviceStatusRefreshMs: normalizeServiceStatusRefreshMs(patch.serviceStatusRefreshMs ?? settings.serviceStatusRefreshMs),
+      limitsRefreshMs: normalizeLimitsRefreshMs(patch.limitsRefreshMs ?? settings.limitsRefreshMs),
+      showLimitSource: parseBoolean(patch.showLimitSource ?? settings.showLimitSource, false),
+      zoomFactor: clampZoom(patch.zoomFactor ?? settings.zoomFactor),
+      ...normalizeTrayModeSettings({
+        showTrayIcon: patch.showTrayIcon ?? settings.showTrayIcon,
+        trayMode: patch.trayMode ?? settings.trayMode
+      }),
+      trayContent: normalizeTrayContent(patch.trayContent ?? settings.trayContent),
+      floatingBubbleContent: normalizeTrayContent(patch.floatingBubbleContent ?? settings.floatingBubbleContent, 'icon'),
+      windowToggleShortcut: normalizeWindowToggleShortcut(patch.windowToggleShortcut ?? settings.windowToggleShortcut),
+      currency: normalizedCurrency,
+      language: patch.language !== undefined ? normalizeLanguageSetting(patch.language, settings.language) : normalizeLanguageSetting(settings.language),
+      startAtLogin: loginItemEnabledHere() ? parseBoolean(patch.startAtLogin ?? settings.startAtLogin, false) : false,
+      deepseekApiKey: patch.deepseekApiKey !== undefined ? normalizeDeepSeekApiKey(patch.deepseekApiKey) : (settings.deepseekApiKey || '')
+    }, normalizedPatch);
+    settings.archivedClientUsage = normalizeArchivedClientUsage(settings.archivedClientUsage);
+    if (settings.clients !== previousClients) updateArchivedClientUsage(previousClients, settings.clients);
+    delete settings.edgeDrawerEnabled;
+    saveSettings();
+    configureWindowToggleShortcut();
+    if (settings.startAtLogin !== previousStartAtLogin) {
+      settings.startAtLogin = applyLoginItem(settings.startAtLogin);
+      saveSettings();
+    }
+    if (patch.zoomFactor !== undefined) applyZoomFactor();
+    if (settings.discordRpcEnabled && !previousDiscordRpcEnabled) {
+      startDiscordRpc();
+      if (latestStats) updateDiscordRpc(latestStats, settings.currency);
+    }
+    else if (!settings.discordRpcEnabled && previousDiscordRpcEnabled) stopDiscordRpc();
+    else if (settings.discordRpcEnabled && settings.currency !== previousCurrency && latestStats) updateDiscordRpc(latestStats, settings.currency);
+    applyWindowSettings();
+    syncFloatingBubbleAvailability();
+    const nextNativeMaterial = nativeBlurEnabled();
+    if (process.platform === 'win32' && previousNativeMaterial !== nextNativeMaterial) {
+      rebuildWindow();
+    } else {
+      applyNativeMaterial();
+    }
+    if (
+      settings.hubMode !== previousHubMode ||
+      settings.hubHostPort !== previousHubHostPort ||
+      settings.hubHostSecret !== previousHubHostSecret ||
+      settings.hubUrl !== previousHubUrl ||
+      settings.secret !== previousSecret ||
+      settings.deviceId !== previousDeviceId ||
+      settings.clients !== previousClients ||
+      settings.limitsEnabled !== previousLimitsEnabled ||
+      settings.limitProviders !== previousLimitProviders ||
+      settings.limitsRefreshMs !== previousLimitsRefreshMs ||
+      settings.usageRefreshMs !== previousUsageRefreshMs ||
+      JSON.stringify(settings.dataDirs || {}) !== previousDataDirs ||
+      settings.historyEnabled !== previousHistoryEnabled ||
+      settings.deepseekApiKey !== previousDeepSeekApiKey
+    ) {
+      startMode();
+    }
+    if (settings.showTrayIcon !== previousShowTrayIcon) {
+      if (settings.showTrayIcon) ensureTray();
+      else destroyTray();
+    }
+    if (settings.trayMode !== previousTrayMode) {
+      if (settings.trayMode) enterTrayMode();
+      else exitTrayMode();
+    } else if (settings.trayContent !== previousTrayContent || settings.currency !== previousCurrency) {
+      updateTrayDisplay();
+    }
+    return settingsForRenderer();
+  });
+  ipcMain.handle('appearance:preview', (_event, patch) => {
+    applyNativeMaterial({ ...settings, ...patch });
+    if (patch && patch.zoomFactor !== undefined && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.setZoomFactor(clampZoom(patch.zoomFactor));
+    }
+    return true;
+  });
+  ipcMain.on('window:viewState', (_event, patch) => {
+    updateRendererViewState(patch);
+  });
+  ipcMain.handle('floatingBubble:expand', () => expandFloatingBubble());
+  ipcMain.handle('floatingBubble:peek', () => expandFloatingBubble({ focus: false }));
+  ipcMain.handle('floatingBubble:collapseIfIdle', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return false;
+    if (floatingBubbleState.collapsed || !canUseFloatingBubble(settings)) return false;
+    if (mainWindow.isFocused()) return false; // promoted to a focused window; let blur handle collapse
+    const bounds = mainWindow.getBounds();
+    if (typeof screen.getCursorScreenPoint === 'function') {
+      const pt = screen.getCursorScreenPoint();
+      const inside = pt.x >= bounds.x && pt.x < bounds.x + bounds.width &&
+        pt.y >= bounds.y && pt.y < bounds.y + bounds.height;
+      if (inside) return false; // cursor returned during the grace window
+    }
+    // A hover peek never receives focus and never blurs, so a stale suppress flag
+    // must not be allowed to wedge it open.
+    floatingBubbleState.suppressNextCollapse = false;
+    return maybeCollapseFloatingBubble(bounds);
+  });
+  ipcMain.handle('floatingBubble:setCollapsedSize', (_event, size) => {
+    if (!size || !canUseFloatingBubble(settings)) return false;
+    const width = Math.round(Number(size.width));
+    const height = Math.round(Number(size.height));
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return false;
+    floatingBubbleState.contentSize = { width, height }; // used by the next collapse
+    if (!floatingBubbleState.collapsed || !mainWindow || mainWindow.isDestroyed()) return true;
+    const current = mainWindow.getBounds();
+    if (current.width === width && current.height === height) return true;
+    const display = displayForBounds(current);
+    if (!display) return true;
+    const collapsedArea = collapsedAreaForDisplay(display);
+    // Keep the docked edge fixed while resizing: collapsedFloatingBubbleBounds re-clamps the
+    // current x/y against the new size (right-docked snaps flush to the edge).
+    const target = collapsedFloatingBubbleBounds(current, collapsedArea, {
+      margin: collapsedMargin(),
+      collapsedBounds: current,
+      handleWidth: width,
+      handleHeight: height
+    });
+    if (!target) return true;
+    applyCollapsedFloatingBubbleLimits(target);
+    mainWindow.setBounds(target);
+    floatingBubbleState.collapsedBounds = target;
+    settings.floatingBubbleBounds = target;
+    saveSettings();
+    return true;
+  });
+  ipcMain.handle('floatingBubble:move', (_event, delta) => {
+    if (!mainWindow || mainWindow.isDestroyed() || !floatingBubbleState.collapsed) return false;
+    const current = mainWindow.getBounds();
+    const hasDragOffset = delta && (
+      Object.hasOwn(delta, 'offsetX') ||
+      Object.hasOwn(delta, 'offsetY') ||
+      Object.hasOwn(delta, 'offsetRatioX') ||
+      Object.hasOwn(delta, 'offsetRatioY')
+    );
+    const cursor = hasDragOffset && typeof screen.getCursorScreenPoint === 'function'
+      ? screen.getCursorScreenPoint()
+      : null;
+    const display = (cursor && displayForPoint(cursor)) || displayForBounds(current);
+    if (!display) return false;
+    const collapsedArea = collapsedAreaForDisplay(display);
+    const margin = collapsedMargin();
+    const target = cursor
+      ? dragFloatingBubbleBounds(current, collapsedArea, cursor, delta, margin)
+      : moveFloatingBubbleBounds(current, collapsedArea, delta, margin);
+    if (!target) return false;
+    floatingBubbleState.collapsedBounds = target;
+    floatingBubbleState.side = floatingBubbleSide(target, collapsedArea);
+    if (target.width === current.width && target.height === current.height && typeof mainWindow.setPosition === 'function') {
+      mainWindow.setPosition(target.x, target.y, false);
+    } else {
+      mainWindow.setBounds(target);
+    }
+    persistBoundsSoon();
+    sendFloatingBubbleState();
+    return true;
+  });
+  ipcMain.handle('tray:setIcons', (_event, icons) => {
+    if (!icons || typeof icons !== 'object') return false;
+    for (const [id, dataUrl] of Object.entries(icons)) {
+      if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/png')) continue;
+      const img = nativeImage.createFromDataURL(dataUrl);
+      if (img.isEmpty()) continue;
+      // Resize by height only; aspect ratio is preserved, so wide bar-style
+      // icons keep their width while square provider icons stay 20x20.
+      const sized = img.resize({ height: 20, quality: 'best' });
+      if (process.platform === 'darwin') sized.setTemplateImage(true);
+      providerTrayIcons[id] = sized;
+    }
+    updateTrayDisplay();
+    return true;
+  });
+  ipcMain.handle('stats:get', (_event, options) => fetchStats(options));
+  ipcMain.handle('session:getDetail', (_event, args) => {
+    const { client, sessionId, period, sessionCost } = args || {};
+    const claudeConfigDir = (settings.dataDirs && settings.dataDirs.claude) || (process.env.CLAUDE_CONFIG_DIR ? path.resolve(process.env.CLAUDE_CONFIG_DIR) : '');
+    return readSessionDetail({ client, sessionId, period, sessionCost, home: os.homedir(), claudeConfigDir });
+  });
+  ipcMain.handle('stream:status', () => ({ connected: streamConnected, mode }));
+  ipcMain.handle('serviceStatus:get', (_event, options) => serviceStatusClient.getServiceStatus({
+    force: Boolean(options?.force),
+    providerIds: Array.isArray(options?.providerIds) ? options.providerIds : null
+  }));
+  ipcMain.handle('hub:getInfo', () => getHubInfo());
+  ipcMain.handle('hub:regenerateSecret', () => {
+    settings.hubHostSecret = generateHubSecret();
+    saveSettings();
+    if (settings.hubMode === 'host') startMode();
+    return getHubInfo();
+  });
+  ipcMain.handle('app:getInfo', () => ({
+    version: app.getVersion(),
+    platform: process.platform,
+    arch: process.arch,
+    osRelease: require('os').release(),
+    isPackaged: app.isPackaged,
+    userData: app.getPath('userData'),
+    sharedDataDir: sharedDataDir(),
+    loginItemSupported: loginItemEnabledHere(),
+    loginItemOpenAtLogin: currentLoginItemState()
+  }));
+  ipcMain.handle('app:openExternal', (_event, url) => {
+    if (!isAllowedExternalUrl(url)) return { ok: false, error: 'url not in allowlist' };
+    return shell.openExternal(url)
+      .then(() => ({ ok: true }))
+      .catch((error) => ({ ok: false, error: error.message }));
+  });
+  ipcMain.handle('app:openUserData', () => shell.openPath(app.getPath('userData')));
+  ipcMain.handle('notify:show', (_event, payload) => {
+    try {
+      if (!Notification.isSupported()) return false;
+      const n = new Notification({ title: String(payload?.title || 'Token Monitor'), body: String(payload?.body || '') });
+      n.show();
+      return true;
+    } catch (_) { return false; }
+  });
+  ipcMain.handle('pricing:get', () => readCustomPricing());
+  ipcMain.handle('pricing:set', async (_event, models) => {
+    const result = writeCustomPricing(models);
+    hourlyRateCache = { at: 0, since: '', data: null };
+    try { await fetchStats({ force: true }); } catch (_) {}
+    return result;
+  });
+  ipcMain.handle('dataDir:listCandidates', () => listClaudeDataDirCandidates());
+  ipcMain.handle('dataDir:browse', async () => {
+    const target = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+    const result = await dialog.showOpenDialog(target, {
+      title: 'Choose Claude data directory',
+      properties: ['openDirectory'],
+      defaultPath: (settings.dataDirs && settings.dataDirs.claude) || process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')
+    });
+    return result.canceled || !result.filePaths.length ? null : result.filePaths[0];
+  });
+  ipcMain.handle('tokscale:getStatus', () => getTokscaleStatus());
+  ipcMain.handle('tokscale:checkNpm', () => checkTokscaleNpm());
+  ipcMain.handle('tokscale:downloadFromNpm', () => downloadTokscaleFromNpm());
+  ipcMain.handle('tokscale:resetToBundled', async () => {
+    tokScaleNpmMetadata = null;
+    const status = await resetToBundled();
+    sendTokscalePush({ type: 'reset', status });
+    return status;
+  });
+  ipcMain.handle('appUpdate:getState', () => deriveAppUpdateState());
+  ipcMain.handle('appUpdate:checkNow', () => runAppUpdateCheck({ force: true }));
+  ipcMain.handle('appUpdate:dismiss', (_event, version) => dismissAppUpdateVersion(version));
+  ipcMain.handle('cursor:loginManual', async (_event, raw) => {
+    const token = normalizeManualCookie(raw);
+    if (!token) return { ok: false, error: 'Empty or malformed token' };
+    try {
+      const probeResult = await cursorProbe.probe(token);
+      if (!probeResult.ok) return { ok: false, error: probeResult.error?.message || 'Cursor rejected the token' };
+      await cursorAuth.runCursorLogin(token);
+      cursorStatusCache = { value: null, at: 0 };
+      return { ok: true, email: probeResult.user.email };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+  ipcMain.handle('opencode:saveCookie', async (_event, raw) => {
+    const cookie = opencodeWeb.sanitizeCookieHeader(raw);
+    if (!cookie) {
+      settings.opencodeCookie = '';
+      saveSettings();
+      opencodeStatusCache = { value: null, at: 0 };
+      startMode();
+      return { ok: true, cleared: true };
+    }
+    try {
+      // Accept the cookie if EITHER Go or Zen authorizes it; only reject when
+      // both report it unauthorized (a genuinely expired/invalid session).
+      const [go, zen] = await Promise.all([
+        opencodeWeb.fetchGoWeb(cookie, {}),
+        opencodeWeb.fetchZen(cookie, {})
+      ]);
+      if (opencodeWeb.summarizeLink(go, zen).expired) {
+        return { ok: false, error: 'OpenCode rejected the cookie (it may be expired)' };
+      }
+      settings.opencodeCookie = cookie;
+      saveSettings();
+      opencodeStatusCache = { value: null, at: 0 };
+      startMode();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+  ipcMain.handle('cursor:logout', async () => {
+    try {
+      await cursorAuth.runCursorLogout();
+      cursorStatusCache = { value: null, at: 0 };
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+  ipcMain.handle('opencode:logout', async () => {
+    try {
+      settings.opencodeCookie = '';
+      saveSettings();
+      opencodeStatusCache = { value: null, at: 0 };
+      startMode();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+  ipcMain.handle('cursor:status', async () => {
+    const now = Date.now();
+    if (cursorStatusCache.value && now - cursorStatusCache.at < CURSOR_STATUS_TTL_MS) {
+      return cursorStatusCache.value;
+    }
+    const account = cursorAuth.readActiveAccount();
+    if (!account) {
+      const value = { loggedIn: false };
+      cursorStatusCache = { value, at: now };
+      return value;
+    }
+    const probeResult = await cursorProbe.probe(account.sessionToken);
+    const value = probeResult.ok
+      ? {
+          loggedIn: true,
+          email: probeResult.user.email,
+          membershipType: probeResult.usage.membershipType,
+          billingCycleEnd: probeResult.usage.billingCycleEnd,
+          expired: false
+        }
+      : { loggedIn: true, expired: probeResult.error?.kind === 'unauthorized', error: probeResult.error?.message };
+    cursorStatusCache = { value, at: now };
+    return value;
+  });
+  ipcMain.handle('opencode:status', async () => {
+    const now = Date.now();
+    if (opencodeStatusCache.value && now - opencodeStatusCache.at < CURSOR_STATUS_TTL_MS) {
+      return opencodeStatusCache.value;
+    }
+    const value = await readOpenCodeStatus();
+    opencodeStatusCache = { value, at: now };
+    return value;
+  });
+  ipcMain.on('window:minimize', () => {
+    if (settings?.trayMode) hidePopover();
+    else mainWindow?.minimize();
+  });
+  ipcMain.on('window:close', () => {
+    if (settings?.trayMode) hidePopover();
+    else mainWindow?.close();
+  });
+  ipcMain.handle('dashboard:open', () => { createDashboardWindow(); return true; });
+  ipcMain.handle('dashboard:getHistory', () => getDashboardHistory());
+  ipcMain.handle('dashboard:getRate', (_event, args) => getUsageRate(args && args.window, args && args.metric, args && args.bucketMs));
+  ipcMain.on('dashboard:minimize', (event) => { BrowserWindow.fromWebContents(event.sender)?.minimize(); });
+  ipcMain.on('dashboard:close', (event) => { BrowserWindow.fromWebContents(event.sender)?.close(); });
+  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+  maybeRunBackgroundUpdateCheck();
+});
+
+app.on('second-instance', focusExistingWindow);
+app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('before-quit', () => { quitRequested = true; unregisterWindowToggleShortcut(); stopAll(); });
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.once(signal, requestAppQuit);
+}

@@ -1,0 +1,91 @@
+﻿'use strict';
+
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('tokenMonitor', {
+  getSettings: () => ipcRenderer.invoke('settings:get'),
+  updateSettings: (patch) => ipcRenderer.invoke('settings:update', patch),
+  previewAppearance: (patch) => ipcRenderer.invoke('appearance:preview', patch),
+  getStats: (options) => ipcRenderer.invoke('stats:get', options),
+  getSessionDetail: (args) => ipcRenderer.invoke('session:getDetail', args),
+  getStreamStatus: () => ipcRenderer.invoke('stream:status'),
+  getServiceStatus: (options) => ipcRenderer.invoke('serviceStatus:get', options),
+  openDashboard: () => ipcRenderer.invoke('dashboard:open'),
+  getDashboardHistory: () => ipcRenderer.invoke('dashboard:getHistory'),
+  getUsageRate: (window, metric, bucketMs) => ipcRenderer.invoke('dashboard:getRate', { window, metric, bucketMs }),
+  dashboard: {
+    minimize: () => ipcRenderer.send('dashboard:minimize'),
+    close: () => ipcRenderer.send('dashboard:close')
+  },
+  getHubInfo: () => ipcRenderer.invoke('hub:getInfo'),
+  regenerateHubSecret: () => ipcRenderer.invoke('hub:regenerateSecret'),
+  onHubPush: (callback) => {
+    const listener = (_event, payload) => { try { callback(payload); } catch (_) {} };
+    ipcRenderer.on('hub:push', listener);
+    return () => ipcRenderer.removeListener('hub:push', listener);
+  },
+  onStatsPush: (callback) => {
+    const listener = (_event, payload) => { try { callback(payload); } catch (_) {} };
+    ipcRenderer.on('stats:push', listener);
+    return () => ipcRenderer.removeListener('stats:push', listener);
+  },
+  onSettingsPush: (callback) => {
+    const listener = (_event, payload) => { try { callback(payload); } catch (_) {} };
+    ipcRenderer.on('settings:push', listener);
+    return () => ipcRenderer.removeListener('settings:push', listener);
+  },
+  onTokscalePush: (callback) => {
+    const listener = (_event, payload) => { try { callback(payload); } catch (_) {} };
+    ipcRenderer.on('tokscale:push', listener);
+    return () => ipcRenderer.removeListener('tokscale:push', listener);
+  },
+  getAppInfo: () => ipcRenderer.invoke('app:getInfo'),
+  dataDir: {
+    listCandidates: () => ipcRenderer.invoke('dataDir:listCandidates'),
+    browse: () => ipcRenderer.invoke('dataDir:browse')
+  },
+  showNotification: (title, body) => ipcRenderer.invoke('notify:show', { title, body }),
+  pricing: {
+    get: () => ipcRenderer.invoke('pricing:get'),
+    set: (models) => ipcRenderer.invoke('pricing:set', models)
+  },
+  openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),
+  openUserData: () => ipcRenderer.invoke('app:openUserData'),
+  getTokscaleStatus: () => ipcRenderer.invoke('tokscale:getStatus'),
+  checkTokscaleNpm: () => ipcRenderer.invoke('tokscale:checkNpm'),
+  downloadTokscaleFromNpm: () => ipcRenderer.invoke('tokscale:downloadFromNpm'),
+  resetTokscaleToBundled: () => ipcRenderer.invoke('tokscale:resetToBundled'),
+  getAppUpdateState: () => ipcRenderer.invoke('appUpdate:getState'),
+  checkAppUpdateNow: () => ipcRenderer.invoke('appUpdate:checkNow'),
+  dismissAppUpdate: (version) => ipcRenderer.invoke('appUpdate:dismiss', version),
+  expandFloatingBubble: () => ipcRenderer.invoke('floatingBubble:expand'),
+  moveFloatingBubble: (delta) => ipcRenderer.invoke('floatingBubble:move', delta),
+  signalContentReady: () => ipcRenderer.send('window:contentReady'),
+  setViewState: (patch) => ipcRenderer.send('window:viewState', patch),
+  peekFloatingBubble: () => ipcRenderer.invoke('floatingBubble:peek'),
+  collapseFloatingBubbleIfIdle: () => ipcRenderer.invoke('floatingBubble:collapseIfIdle'),
+  setFloatingBubbleCollapsedSize: (size) => ipcRenderer.invoke('floatingBubble:setCollapsedSize', size),
+  onFloatingBubbleState: (callback) => {
+    const listener = (_event, payload) => { try { callback(payload); } catch (_) {} };
+    ipcRenderer.on('floatingBubble:state', listener);
+    return () => ipcRenderer.removeListener('floatingBubble:state', listener);
+  },
+  onAppUpdatePush: (callback) => {
+    const listener = (_event, payload) => { try { callback(payload); } catch (_) {} };
+    ipcRenderer.on('appUpdate:push', listener);
+    return () => ipcRenderer.removeListener('appUpdate:push', listener);
+  },
+  setTrayIcons: (icons) => ipcRenderer.invoke('tray:setIcons', icons),
+  cursor: {
+    loginManual: (token) => ipcRenderer.invoke('cursor:loginManual', token),
+    logout: () => ipcRenderer.invoke('cursor:logout'),
+    status: () => ipcRenderer.invoke('cursor:status')
+  },
+  opencode: {
+    saveCookie: (cookie) => ipcRenderer.invoke('opencode:saveCookie', cookie),
+    logout: () => ipcRenderer.invoke('opencode:logout'),
+    status: () => ipcRenderer.invoke('opencode:status')
+  },
+  minimize: () => ipcRenderer.send('window:minimize'),
+  close: () => ipcRenderer.send('window:close')
+});

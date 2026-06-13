@@ -1,0 +1,333 @@
+'use strict';
+
+// Guards against the runaway-collection loop from issue #15: watching our own
+// sync-cache dirs re-triggered ticks forever, and each tick spawned concurrent
+// tokscale scans plus an unconditional antigravity sync.
+
+const assert = require('node:assert/strict');
+const test = require('node:test');
+const { EventEmitter } = require('node:events');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const collectorPath = require.resolve('../../src/shared/collector');
+
+function freshCollector() {
+  delete require.cache[collectorPath];
+  return require(collectorPath);
+}
+
+function withTmpHome(prepare) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'token-monitor-home-'));
+  for (const dir of prepare) fs.mkdirSync(path.join(tmp, dir), { recursive: true });
+  return tmp;
+}
+
+function recordingSpawn(calls) {
+  return (_bin, args) => {
+    calls.push(args);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { end: () => {} };
+    child.kill = () => {};
+    setImmediate(() => {
+      child.stdout.emit('data', Buffer.from(JSON.stringify({ entries: [] })));
+      child.emit('close', 0);
+    });
+    return child;
+  };
+}
+
+test('watchPathsForClients excludes the tokscale cache dirs our own syncs write', () => {
+  const tmp = withTmpHome([
+    path.join('.claude', 'projects'),
+    path.join('.config', 'tokscale', 'cursor-cache'),
+    path.join('.config', 'tokscale', 'antigravity-cache')
+  ]);
+  const originalHomedir = os.homedir;
+  os.homedir = () => tmp;
+  // Isolated home: neutralize any ambient CLAUDE_CONFIG_DIR so claude resolves under `tmp`.
+  const savedClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  delete process.env.CLAUDE_CONFIG_DIR;
+  try {
+    const { watchPathsForClients } = freshCollector();
+    const dirs = watchPathsForClients('claude,cursor,antigravity');
+    assert.ok(dirs.includes(path.join(tmp, '.claude', 'projects')));
+    assert.equal(dirs.filter((dir) => dir.includes(path.join('.config', 'tokscale'))).length, 0);
+  } finally {
+    os.homedir = originalHomedir;
+    if (savedClaudeConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = savedClaudeConfigDir;
+    delete require.cache[collectorPath];
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('clientDataDirPresence still detects cursor/antigravity via their cache dirs', () => {
+  const tmp = withTmpHome([
+    path.join('.config', 'tokscale', 'cursor-cache'),
+    path.join('.config', 'tokscale', 'antigravity-cache')
+  ]);
+  const originalHomedir = os.homedir;
+  os.homedir = () => tmp;
+  try {
+    const { clientDataDirPresence } = freshCollector();
+    const presence = clientDataDirPresence('cursor,antigravity');
+    assert.equal(presence.cursor, true);
+    assert.equal(presence.antigravity, true);
+  } finally {
+    os.homedir = originalHomedir;
+    delete require.cache[collectorPath];
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('watchPathsForClients includes Kimi, Qwen, and Grok Build local roots', () => {
+  const tmp = withTmpHome([
+    path.join('.kimi', 'sessions'),
+    path.join('.kimi-code', 'sessions'),
+    path.join('.qwen', 'projects'),
+    path.join('.grok', 'sessions')
+  ]);
+  const originalHomedir = os.homedir;
+  const previousKimiCodeHome = process.env.KIMI_CODE_HOME;
+  const previousGrokHome = process.env.GROK_HOME;
+  os.homedir = () => tmp;
+  try {
+    delete process.env.KIMI_CODE_HOME;
+    delete process.env.GROK_HOME;
+    const { clientDataDirPresence, watchPathsForClients } = freshCollector();
+    const dirs = watchPathsForClients('kimi,qwen,grok');
+    assert.ok(dirs.includes(path.join(tmp, '.kimi', 'sessions')));
+    assert.ok(dirs.includes(path.join(tmp, '.kimi-code', 'sessions')));
+    assert.ok(dirs.includes(path.join(tmp, '.qwen', 'projects')));
+    assert.ok(dirs.includes(path.join(tmp, '.grok', 'sessions')));
+    assert.deepEqual(clientDataDirPresence('kimi,qwen,grok'), { kimi: true, qwen: true, grok: true });
+  } finally {
+    os.homedir = originalHomedir;
+    if (previousKimiCodeHome === undefined) delete process.env.KIMI_CODE_HOME;
+    else process.env.KIMI_CODE_HOME = previousKimiCodeHome;
+    if (previousGrokHome === undefined) delete process.env.GROK_HOME;
+    else process.env.GROK_HOME = previousGrokHome;
+    delete require.cache[collectorPath];
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('collectUsageOnce skips antigravity sync when no antigravity data root exists', async () => {
+  const tmp = withTmpHome([]);
+  const childProcess = require('node:child_process');
+  const originalSpawn = childProcess.spawn;
+  const calls = [];
+  childProcess.spawn = recordingSpawn(calls);
+  try {
+    const { collectUsageOnce } = freshCollector();
+    await collectUsageOnce({
+      clients: 'antigravity',
+      allTimeSince: '2024-01-01',
+      commandTimeoutMs: 1000,
+      deviceId: 'test-device',
+      agentVersion: 'test',
+      limitsEnabled: false,
+      homeDir: tmp
+    });
+    assert.equal(calls.filter((args) => args.includes('sync')).length, 0);
+  } finally {
+    childProcess.spawn = originalSpawn;
+    delete require.cache[collectorPath];
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('antigravity sync runs at most once per throttle window across ticks', async () => {
+  const tmp = withTmpHome([path.join('.gemini', 'antigravity')]);
+  const childProcess = require('node:child_process');
+  const originalSpawn = childProcess.spawn;
+  const calls = [];
+  childProcess.spawn = recordingSpawn(calls);
+  try {
+    const { collectUsageOnce } = freshCollector();
+    const options = {
+      clients: 'antigravity',
+      allTimeSince: '2024-01-01',
+      commandTimeoutMs: 1000,
+      deviceId: 'test-device',
+      agentVersion: 'test',
+      limitsEnabled: false,
+      homeDir: tmp
+    };
+    await collectUsageOnce(options);
+    await collectUsageOnce(options);
+    assert.equal(calls.filter((args) => args.includes('sync')).length, 1);
+  } finally {
+    childProcess.spawn = originalSpawn;
+    delete require.cache[collectorPath];
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('cursor sync runs at most once per throttle window across ticks', async () => {
+  const childProcess = require('node:child_process');
+  const originalSpawn = childProcess.spawn;
+  childProcess.spawn = recordingSpawn([]);
+  const cursorAuth = require('../../src/shared/cursorAuth');
+  const originalReadActiveAccount = cursorAuth.readActiveAccount;
+  const originalRunCursorSync = cursorAuth.runCursorSync;
+  let syncCalls = 0;
+  cursorAuth.readActiveAccount = () => ({ accessToken: 'token' });
+  cursorAuth.runCursorSync = async () => { syncCalls += 1; };
+  try {
+    const { collectUsageOnce } = freshCollector();
+    const options = {
+      clients: 'cursor',
+      allTimeSince: '2024-01-01',
+      commandTimeoutMs: 1000,
+      deviceId: 'test-device',
+      agentVersion: 'test',
+      limitsEnabled: false
+    };
+    await collectUsageOnce(options);
+    await collectUsageOnce(options);
+    assert.equal(syncCalls, 1);
+  } finally {
+    childProcess.spawn = originalSpawn;
+    cursorAuth.readActiveAccount = originalReadActiveAccount;
+    cursorAuth.runCursorSync = originalRunCursorSync;
+    delete require.cache[collectorPath];
+  }
+});
+
+test('collectUsageOnce runs the three tokscale scans serially, not concurrently', async () => {
+  const childProcess = require('node:child_process');
+  const originalSpawn = childProcess.spawn;
+  let active = 0;
+  let maxActive = 0;
+  childProcess.spawn = () => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { end: () => {} };
+    child.kill = () => {};
+    setImmediate(() => {
+      child.stdout.emit('data', Buffer.from(JSON.stringify({ entries: [] })));
+      active -= 1;
+      child.emit('close', 0);
+    });
+    return child;
+  };
+  try {
+    const { collectUsageOnce } = freshCollector();
+    await collectUsageOnce({
+      clients: 'claude',
+      allTimeSince: '2024-01-01',
+      commandTimeoutMs: 1000,
+      deviceId: 'test-device',
+      agentVersion: 'test',
+      limitsEnabled: false
+    });
+    assert.equal(maxActive, 1);
+  } finally {
+    childProcess.spawn = originalSpawn;
+    delete require.cache[collectorPath];
+  }
+});
+
+test('collector exposes no watch-cooldown knob (refresh cadence is debounce-only)', () => {
+  const collector = freshCollector();
+  assert.equal(collector.watchDelayMs, undefined);
+});
+
+function waitForCondition(predicate, timeoutMs = 2000) {
+  if (predicate()) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const interval = setInterval(() => {
+      if (predicate()) {
+        clearInterval(interval);
+        resolve();
+      } else if (Date.now() - startedAt > timeoutMs) {
+        clearInterval(interval);
+        reject(new Error('Timed out waiting for condition'));
+      }
+    }, 5);
+  });
+}
+
+test('a watch event during an in-flight tick re-arms the debounce instead of coalescing into a full rescan', async () => {
+  const tmp = withTmpHome([path.join('.claude', 'projects')]);
+  const originalHomedir = os.homedir;
+  os.homedir = () => tmp;
+
+  const chokidar = require('chokidar');
+  const originalWatch = chokidar.watch;
+  let watchHandler = null;
+  chokidar.watch = () => ({
+    on: (event, handler) => { if (event === 'all') watchHandler = handler; },
+    close: () => {}
+  });
+
+  const childProcess = require('node:child_process');
+  const originalSpawn = childProcess.spawn;
+  const calls = [];
+  let spawnDelayMs = 5;
+  childProcess.spawn = (_bin, args) => {
+    calls.push(args);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { end: () => {} };
+    child.kill = () => {};
+    setTimeout(() => {
+      child.stdout.emit('data', Buffer.from(JSON.stringify({ entries: [] })));
+      child.emit('close', 0);
+    }, spawnDelayMs);
+    return child;
+  };
+
+  let handle = null;
+  try {
+    const { startCollector } = freshCollector();
+    const updates = [];
+    handle = startCollector({
+      clients: 'claude',
+      allTimeSince: '2024-01-01',
+      commandTimeoutMs: 5000,
+      deviceId: 'test-device',
+      agentVersion: 'test',
+      intervalMs: 60 * 60 * 1000,
+      watchEnabled: true,
+      watchDebounceMs: 10,
+      limitsEnabled: false,
+      historyEnabled: false,
+      onUpdate: (_summary, reason) => updates.push(reason)
+    });
+
+    // Initial interval tick: full serial scan (3 spawns).
+    await waitForCondition(() => updates.length === 1);
+    assert.equal(calls.length, 3);
+    assert.ok(watchHandler, 'watcher handler captured');
+
+    // Slow ticks down so the second watch event lands while one is in flight.
+    spawnDelayMs = 150;
+    watchHandler('change', '/fake/session.jsonl');
+    await waitForCondition(() => calls.length === 4);
+    watchHandler('change', '/fake/session.jsonl');
+
+    await waitForCondition(() => updates.length === 3);
+    // Re-armed tick stays a today-only single scan; the old coalesce path
+    // would have run a full 3-scan tick with reason 'coalesced'.
+    assert.equal(calls.length, 5);
+    assert.ok(!updates.includes('coalesced'), `unexpected coalesced tick in: ${updates.join(', ')}`);
+  } finally {
+    if (handle) handle.stop();
+    childProcess.spawn = originalSpawn;
+    chokidar.watch = originalWatch;
+    os.homedir = originalHomedir;
+    delete require.cache[collectorPath];
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
